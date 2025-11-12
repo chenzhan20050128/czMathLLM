@@ -157,6 +157,9 @@ def _apply_common_overrides(project: ProjectConfig, args) -> None:
         )
         or project.grpo.gradient_accumulation_steps
     )
+    grpo_save_steps = getattr(args, "grpo_save_steps", None)
+    if grpo_save_steps is not None:
+        project.grpo.save_steps = grpo_save_steps
     grpo_reference_free = getattr(args, "grpo_reference_free", None)
     if grpo_reference_free is not None:
         project.grpo.reference_free = grpo_reference_free
@@ -169,6 +172,11 @@ def _apply_common_overrides(project: ProjectConfig, args) -> None:
     num_generations = getattr(args, "grpo_num_generations", None)
     if num_generations is not None:
         project.grpo.num_generations_per_prompt = num_generations
+    max_tokens_per_step = getattr(args, "grpo_max_tokens_per_step", None)
+    if max_tokens_per_step is not None:
+        project.grpo.max_tokens_per_step = (
+            max_tokens_per_step if max_tokens_per_step > 0 else None
+        )
     grpo_dataset_arg = getattr(args, "grpo_dataset", None)
     if grpo_dataset_arg is not None:
         parsed = _parse_source_arg(grpo_dataset_arg)
@@ -297,6 +305,21 @@ def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=None,
         help="Override number of generations per prompt during GRPO",
+    )
+    parser.add_argument(
+        "--grpo-save-steps",
+        type=int,
+        default=None,
+        help="Save GRPO checkpoints every N training steps",
+    )
+    parser.add_argument(
+        "--grpo-max-tokens-per-step",
+        type=int,
+        default=None,
+        help=(
+            "Soft upper bound on the estimated tokens per optimization step; when set,"
+            " the trainer will clip prompt/completion lengths to respect this budget."
+        ),
     )
 
 

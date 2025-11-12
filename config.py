@@ -198,8 +198,43 @@ class GRPOConfig:
     reward_temperature: float = 1.0
     reference_free: bool = True
     mixed_precision: Optional[str] = "bf16"
-    save_steps: int = 100
+    save_steps: int = 20
     dataset: Optional[DatasetSource] = field(default_factory=_default_grpo_dataset)
+    max_tokens_per_step: Optional[int] = None
+
+    def describe_workload(self, training: TrainingConfig) -> dict[str, int]:
+        """估算单步 GRPO 训练的 token 与样本开销。"""
+
+        effective_batch = max(
+            1,
+            self.mini_batch_size * max(1, self.gradient_accumulation_steps),
+        )
+        prompt_len = max(1, min(self.max_prompt_len, training.max_seq_length))
+
+        # 计算可分配给 completion 的最大长度，确保不超过模型支持的序列长度。
+        completion_capacity = max(1, training.max_seq_length - prompt_len)
+        completion_len = max(
+            1,
+            min(self.max_completion_len, completion_capacity),
+        )
+
+        num_generations = max(1, self.num_generations_per_prompt)
+        completions_per_step = effective_batch * num_generations
+
+        prompt_tokens = effective_batch * prompt_len
+        completion_tokens = completions_per_step * completion_len
+        total_tokens = prompt_tokens + completion_tokens
+
+        return {
+            "effective_batch": effective_batch,
+            "prompt_len": prompt_len,
+            "completion_len": completion_len,
+            "num_generations": num_generations,
+            "completions_per_step": completions_per_step,
+            "prompt_tokens": prompt_tokens,
+            "completion_tokens": completion_tokens,
+            "tokens_per_step": total_tokens,
+        }
 
 
 @dataclass(slots=True)

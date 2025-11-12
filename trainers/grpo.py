@@ -18,11 +18,155 @@ from peft import PeftModel
 from trl.trainer.grpo_config import GRPOConfig as HFGRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
 
-from ..config import ProjectConfig
+from ..config import GRPOConfig, ProjectConfig, TrainingConfig
 from ..data import build_grpo_dataset, build_sft_datasets, load_dataset_source
 from ..modeling import load_base_model, merge_and_save
 from ..reward import batch_reward
 from ..utils import set_global_seed
+
+
+TOKEN_WARNING_THRESHOLD = 160_000
+BASE_THROUGHPUT_TOK_PER_S = 320.0
+
+
+def _format_int(value: int) -> str:
+    return f"{value:,}"
+
+
+def _apply_token_budget_once(
+    training_cfg: TrainingConfig,
+    grpo_cfg: GRPOConfig,
+    workload: dict[str, int],
+    budget: int,
+) -> tuple[dict[str, int], bool]:
+    """Apply a single round of token budget clipping."""
+
+    updated = False
+    effective_batch = workload["effective_batch"]
+    completions_per_step = workload["completions_per_step"]
+    prompt_tokens = workload["prompt_tokens"]
+    available_for_completions = budget - prompt_tokens
+
+    if available_for_completions > 0 and completions_per_step > 0:
+        raw_limit = available_for_completions // max(completions_per_step, 1)
+        if raw_limit < 32:
+            print(
+                "[GRPO] token预算过低，无法仅通过裁剪 max_completion_len 满足开销。"
+                " 可尝试减小 --grpo-num-generations、--grpo-mini-batch 或"
+                " --grpo-gradient-accumulation。"
+            )
+        elif raw_limit < grpo_cfg.max_completion_len:
+            print(
+                "[GRPO] 自动裁剪 max_completion_len: "
+                f"{grpo_cfg.max_completion_len} -> {raw_limit} "
+                f"（预算 {_format_int(budget)}）。"
+            )
+            grpo_cfg.max_completion_len = int(raw_limit)
+            updated = True
+    else:
+        prompt_limit = budget // max(effective_batch, 1)
+        if prompt_limit < 64:
+            print(
+                "[GRPO] token预算过低，当前批次规模下无法满足。"
+                " 请考虑减小 --grpo-mini-batch 或 --grpo-gradient-accumulation。"
+            )
+        elif prompt_limit < grpo_cfg.max_prompt_len:
+            print(
+                "[GRPO] 自动裁剪 max_prompt_len: "
+                f"{grpo_cfg.max_prompt_len} -> {prompt_limit} "
+                f"（预算 {_format_int(budget)}）。"
+            )
+            grpo_cfg.max_prompt_len = int(prompt_limit)
+            updated = True
+
+    if (
+        grpo_cfg.max_prompt_len + grpo_cfg.max_completion_len
+        > training_cfg.max_seq_length
+    ):
+        cap = max(training_cfg.max_seq_length - grpo_cfg.max_prompt_len, 64)
+        if cap < grpo_cfg.max_completion_len:
+            print(
+                "[GRPO] 自动限制 max_completion_len 以符合模型最大序列长度: "
+                f"{grpo_cfg.max_completion_len} -> {cap}。"
+            )
+            grpo_cfg.max_completion_len = cap
+            updated = True
+
+    if updated:
+        return grpo_cfg.describe_workload(training_cfg), True
+    return workload, False
+
+
+def _apply_token_budget(
+    training_cfg: TrainingConfig,
+    grpo_cfg: GRPOConfig,
+    workload: dict[str, int],
+) -> dict[str, int]:
+    budget = grpo_cfg.max_tokens_per_step
+    if not budget or budget <= 0:
+        return workload
+    while workload["tokens_per_step"] > budget:
+        workload, updated = _apply_token_budget_once(
+            training_cfg,
+            grpo_cfg,
+            workload,
+            budget,
+        )
+        if not updated:
+            break
+    return workload
+
+
+def _log_workload(grpo_cfg: GRPOConfig, workload: dict[str, int]) -> None:
+    effective_batch = workload["effective_batch"]
+    completions_per_step = workload["completions_per_step"]
+    tokens_per_step = workload["tokens_per_step"]
+    prompt_len = workload["prompt_len"]
+    completion_len = workload["completion_len"]
+
+    batch_info = _format_int(effective_batch)
+    mini_batch = grpo_cfg.mini_batch_size
+    grad_accum = grpo_cfg.gradient_accumulation_steps
+    print(
+        "[GRPO] 有效prompt批次 = "
+        f"{batch_info} (mini_batch={mini_batch}, "
+        f"grad_accum={grad_accum})"
+    )
+    print(
+        "        每step生成 "
+        f"{_format_int(completions_per_step)} 条completion "
+        f"(每prompt {grpo_cfg.num_generations_per_prompt} 条)。"
+    )
+    print(
+        "[GRPO] 估算单step token 开销 ≈ "
+        f"{_format_int(tokens_per_step)} (prompt_len={prompt_len}, "
+        f"completion_len={completion_len})。"
+    )
+    if not grpo_cfg.reference_free:
+        print("[GRPO] 当前启用了参考模型，logprob 计算将额外增加一次完整的前向传播。")
+
+    if grpo_cfg.max_tokens_per_step:
+        print(
+            "[GRPO] token预算设定为 "
+            f"{_format_int(grpo_cfg.max_tokens_per_step)}，"
+            f"估算开销 {_format_int(tokens_per_step)}。"
+        )
+
+    if (
+        grpo_cfg.max_tokens_per_step in (None, 0)
+        and tokens_per_step > TOKEN_WARNING_THRESHOLD
+    ):
+        approx_minutes = tokens_per_step / BASE_THROUGHPUT_TOK_PER_S / 60.0
+        print(
+            "[GRPO][提示] 该配置预计每step耗时约 "
+            f"{approx_minutes:.1f} 分钟（按 "
+            f"{int(BASE_THROUGHPUT_TOK_PER_S)} tok/s 估算）。"
+        )
+        print(
+            "        若需更快迭代，可减小 --grpo-num-generations、"
+            "--grpo-max-completion-len、--grpo-mini-batch 或"
+            " --grpo-gradient-accumulation。"
+        )
 
 
 def _reward_function(
@@ -50,6 +194,10 @@ def run_grpo_training(
         return {}
 
     set_global_seed(training_cfg.random_seed)
+
+    workload = grpo_cfg.describe_workload(training_cfg)
+    workload = _apply_token_budget(training_cfg, grpo_cfg, workload)
+    _log_workload(grpo_cfg, workload)
 
     def _resolve_peft_dir() -> Path:
         candidates: list[Path] = []
@@ -142,6 +290,8 @@ def run_grpo_training(
         return _reward_function(samples, references=refs, metadatas=metas)
 
     # `dataclasses.fields` 可动态枚举 HF 配置的字段，便于跨版本兼容。
+    grpo_output_dir = Path(training_cfg.checkpoints_dir) / "grpo"
+    grpo_output_dir.mkdir(parents=True, exist_ok=True)
     config_kwargs = {}
     available_fields = {field.name for field in fields(HFGRPOConfig)}
     if "learning_rate" in available_fields:
@@ -170,6 +320,8 @@ def run_grpo_training(
         config_kwargs["mixed_precision"] = grpo_cfg.mixed_precision
     if "save_steps" in available_fields:
         config_kwargs["save_steps"] = grpo_cfg.save_steps
+    if "output_dir" in available_fields:
+        config_kwargs["output_dir"] = str(grpo_output_dir)
     if "generation_batch_size" in available_fields:
         config_kwargs["generation_batch_size"] = grpo_cfg.mini_batch_size
     if "num_generations" in available_fields:
