@@ -375,8 +375,8 @@ def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--grpo-learning-rate", type=float, default=8e-6)
     parser.add_argument("--grpo-beta", type=float, default=0.2)
     parser.add_argument("--grpo-kl", type=float, default=0.06)
-    parser.add_argument("--grpo-mini-batch", type=int, default=4)
-    parser.add_argument("--grpo-gradient-accumulation", type=int, default=2)
+    parser.add_argument("--grpo-mini-batch", type=int, default=16)
+    parser.add_argument("--grpo-gradient-accumulation", type=int, default=1)
     parser.add_argument(
         "--grpo-reference-free",
         dest="grpo_reference_free",

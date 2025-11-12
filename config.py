@@ -278,8 +278,8 @@ class GRPOConfig:
     clip_range: float = 0.2
     kl_coef: float = 0.06
     value_loss_coef: float = 0.01
-    mini_batch_size: int = 4
-    gradient_accumulation_steps: int = 2
+    mini_batch_size: int = 8
+    gradient_accumulation_steps: int = 1
     num_generations_per_prompt: int = 2
     max_prompt_len: int = 768
     max_completion_len: int = 2048
@@ -287,7 +287,7 @@ class GRPOConfig:
     reference_free: bool = False
     mixed_precision: Optional[str] = "bf16"
     save_steps: int = 20
-    unsloth_num_chunks: int = -1
+    unsloth_num_chunks: int = 1
     dataset: Optional[DatasetSource] = field(default_factory=_default_grpo_dataset)
     max_tokens_per_step: Optional[int] = None
 

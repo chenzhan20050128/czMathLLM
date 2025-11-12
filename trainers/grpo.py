@@ -28,6 +28,7 @@ from peft import PeftModel
 # 从 trl 库导入 GRPO 专用的配置类和训练器类。
 from trl.trainer.grpo_config import GRPOConfig as HFGRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
+from transformers.trainer_callback import TrainerCallback
 
 from ..config import GRPOConfig, ProjectConfig, TrainingConfig
 from ..data import build_grpo_dataset, build_sft_datasets, load_dataset_source
@@ -38,6 +39,82 @@ from ..utils import set_global_seed, dump_dataclass
 
 TOKEN_WARNING_THRESHOLD = 160_000
 BASE_THROUGHPUT_TOK_PER_S = 320.0
+MAX_LOGGED_COMPLETION_CHARS = 4096
+
+
+class _RewardBuffer:
+    def __init__(self, max_chars: int = MAX_LOGGED_COMPLETION_CHARS) -> None:
+        self._records: list[tuple[str, str, float]] = []
+        self._max_chars = max_chars
+
+    def record(
+        self,
+        prompts: list[str],
+        samples: list[str],
+        rewards: list[float],
+    ) -> None:
+        if not prompts or not samples or not rewards:
+            return
+        for prompt, sample, reward in zip(prompts, samples, rewards):
+            try:
+                reward_value = float(reward)
+            except (TypeError, ValueError):
+                continue
+            self._records.append((prompt, sample, reward_value))
+
+    def flush(self, step: int) -> None:
+        if not self._records:
+            return
+
+        total_reward = sum(record[2] for record in self._records)
+        count = len(self._records)
+        avg_reward = total_reward / max(count, 1)
+        best_prompt, best_sample, best_reward = max(
+            self._records, key=lambda record: record[2]
+        )
+
+        message = (
+            "[GRPO][step {step}] reward mean = {avg:.4f}, " "max = {best:.4f}"
+        ).format(
+            step=step,
+            avg=avg_reward,
+            best=best_reward,
+        )
+        print(message, flush=True)
+
+        display_sample = best_sample
+        truncated = False
+        if len(display_sample) > self._max_chars:
+            display_sample = display_sample[: self._max_chars] + "\n... [truncated]"
+            truncated = True
+
+        print(
+            f"[GRPO][step {step}] prompt (best reward):\n{best_prompt}",
+            flush=True,
+        )
+        print(
+            f"[GRPO][step {step}] completion (best reward):\n{display_sample}",
+            flush=True,
+        )
+        if truncated:
+            print(
+                f"[GRPO][step {step}] 注意：输出已截断为 {self._max_chars} 字符，避免日志过长。",
+                flush=True,
+            )
+
+        self._records.clear()
+
+
+class _RewardLoggingCallback(TrainerCallback):
+    def __init__(self, buffer: _RewardBuffer) -> None:
+        self._buffer = buffer
+
+    def on_step_end(self, args, state, control, **kwargs):
+        self._buffer.flush(state.global_step)
+
+    def on_train_end(self, args, state, control, **kwargs):
+        # 确保训练结束时残留的记录被输出。
+        self._buffer.flush(state.global_step)
 
 
 def _format_int(value: int) -> str:
@@ -213,7 +290,8 @@ def run_grpo_training(
           `ref_model`，但其权重是冻结的，仅用于计算 KL 散度。
     3.  **数据准备**:
         - 加载用于 GRPO 的源数据集。
-        - 使用 `build_grpo_dataset` 将其转换为包含 `prompt`, `reference`, `metadata` 的格式。
+                - 使用 `build_grpo_dataset` 将其转换为包含 `prompt`,
+                    `reference`, `metadata` 的格式。
         - 创建一个 `prompt_lookup` 字典，用于在奖励计算时根据 `prompt` 快速查找其对应的
           `reference` 和 `metadata`。
     4.  **奖励函数准备**: 定义一个闭包 `reward_fn`。这个函数在被 TRL 调用时，
@@ -236,12 +314,17 @@ def run_grpo_training(
     if not grpo_cfg.enable:
         return {}
 
-    dump_dataclass(project, training_cfg.output_dir / "project_config_grpo.json")
+    dump_dataclass(
+        project,
+        training_cfg.output_dir / "project_config_grpo.json",
+    )
     set_global_seed(training_cfg.random_seed)
 
     workload = grpo_cfg.describe_workload(training_cfg)
     workload = _apply_token_budget(training_cfg, grpo_cfg, workload)
     _log_workload(grpo_cfg, workload)
+
+    reward_buffer = _RewardBuffer()
 
     def _resolve_peft_dir() -> Path:
         candidates: list[Path] = []
@@ -340,7 +423,9 @@ def run_grpo_training(
             reference, metadata = prompt_lookup.get(prompt, ("", {}))
             refs.append(reference)
             metas.append(metadata)
-        return _reward_function(samples, references=refs, metadatas=metas)
+        rewards = _reward_function(samples, references=refs, metadatas=metas)
+        reward_buffer.record(prompts, samples, rewards)
+        return rewards
 
     # `dataclasses.fields` 可动态枚举 HF 配置的字段，便于跨版本兼容。
     grpo_output_dir = Path(training_cfg.checkpoints_dir) / "grpo"
@@ -415,6 +500,7 @@ def run_grpo_training(
 
     # 6. 初始化并执行训练
     trainer = GRPOTrainer(**trainer_kwargs)
+    trainer.add_callback(_RewardLoggingCallback(reward_buffer))
 
     train_kwargs = {}
     train_sig = inspect.signature(trainer.train)
