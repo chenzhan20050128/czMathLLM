@@ -11,6 +11,7 @@
 """
 
 # from __future__ import annotations: 同样是为了支持延迟解析类型注解。
+# 在 Python 3.10+ 中，类型注解可以在定义前使用，此导入是为了向前兼容。
 from __future__ import annotations
 
 import argparse
@@ -34,18 +35,22 @@ def _load_dataset_mix(
 ) -> tuple[DatasetSource, ...]:
     """根据命令行参数生成数据源组合。
 
-    此函数实现了灵活的数据集配置加载：
-    1.  如果提供了 `--dataset-config` 参数，它会读取一个 JSON 文件，
-        该文件定义了要使用的所有数据集及其属性。
+    此函数实现了灵活的数据集配置加载，优先级如下：
+    1.  如果提供了 `--dataset-config` 参数，它会读取一个 JSON 文件。
+        该文件定义了要使用的所有数据集及其属性（名称、权重、是否为推理任务等）。
+        这是最灵活和推荐的方式，便于管理复杂的数据集组合。
     2.  否则，它会尝试从 `--reasoning-source` 和 `--instruction-source`
-        参数中单独解析每个数据源。
+        参数中单独解析每个数据源。这适用于简单的一或两个数据集的场景。
     3.  如果命令行没有提供任何数据源信息，则使用 `default_mix` 中定义的默认配置。
+        这确保了即使不提供任何参数，程序也能以一个合理的默认设置运行。
     """
     if args.dataset_config:
         config_path = Path(args.dataset_config)
+        # 使用 with 语句确保文件被正确关闭
         with config_path.open("r", encoding="utf-8") as fh:
             data = json.load(fh)
         # 使用列表推导和星号解包（`**entry`）将 JSON 对象列表转换为 `DatasetSource` 对象元组。
+        # 这是一个非常 Pythonic 的写法，简洁地将字典数据映射到 Pydantic 模型实例。
         return tuple(DatasetSource(**entry) for entry in data)
 
     # 解析推理和指令数据集的参数。
@@ -77,13 +82,14 @@ def _load_dataset_mix(
 
 
 def _parse_source_arg(arg: Optional[str]) -> Optional[dict]:
-    """解析单个数据源字符串。
+    """解析单个数据源字符串，将其转换为 `DatasetSource` 构造函数所需的字典。
 
-    这个辅助函数非常灵活，可以接受多种格式的输入：
-    - "none" 或空字符串: 表示不使用该数据源。
-    - 本地路径: 如果字符串对应一个存在的本地文件或目录。
+    这个辅助函数非常灵活，可以接受多种格式的输入，体现了良好的用户体验设计：
+    - "none" 或空字符串: 明确表示不使用该数据源。
+    - 本地路径: 如果字符串对应一个存在的本地文件或目录，则将其识别为路径。
     - Hugging Face 仓库名: 例如 "mlabonne/FineTome-100k"。
-    - "仓库名:子集名": 例如 "open-r1/DAPO-Math-17k-Processed:en"。
+    - "仓库名:子集名": 例如 "open-r1/DAPO-Math-17k-Processed:en"，用于加载包含多个子集的数据集。
+    - 启发式路径判断：即使文件当前不存在，如果它以常见的数据文件扩展名结尾，也假定它是一个路径。
 
     返回一个字典，其键值对可以直接用于创建 `DatasetSource` 对象。
     """
@@ -96,14 +102,16 @@ def _parse_source_arg(arg: Optional[str]) -> Optional[dict]:
     if path_candidate.exists():
         return {"path": str(path_candidate)}
 
-    # 启发式地判断是否为文件路径（即使文件当前不存在）
+    # 启发式地判断是否为文件路径（即使文件当前不存在），这在某些部署场景下很有用。
     if any(arg.endswith(ext) for ext in (".json", ".jsonl", ".jsonl.gz", ".parquet")):
         return {"path": arg}
 
+    # 如果包含冒号，则解析为 "仓库名:子集名" 的格式
     if ":" in arg:
         name, subset = arg.split(":", 1)
         return {"name": name, "subset": subset}
 
+    # 默认情况下，将其视为一个 Hugging Face 仓库名
     return {"name": arg}
 
 
@@ -111,14 +119,15 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
     """将命令行传入的参数覆盖到 `ProjectConfig` 对象上。
 
     这个函数是连接命令行和内部配置的桥梁。它遍历所有可能的命令行参数，
-    如果用户在命令行中指定了某个参数，就用该参数的值更新 `ProjectConfig` 对象中
+    如果用户在命令行中指定了某个参数（即其值不是 None），就用该参数的值更新 `ProjectConfig` 对象中
     对应的字段。
 
-    使用 `getattr(args, "param_name", default_value)` 是一种非常优雅的处理方式：
-    - 它尝试从 `args` 对象中获取名为 "param_name" 的属性。
-    - 如果该属性不存在（例如，因为这个参数属于另一个子命令），它不会抛出错误，
-      而是返回一个 `default_value`。
-    - 这使得我们可以编写一个通用的覆盖函数，而无需担心哪些参数在当前上下文中是可用的。
+    使用 `getattr(args, "param_name", default_value)` 是一种非常优雅和健壮的编程模式：
+    - 它尝试从 `args` 对象（由 argparse 解析命令行参数生成）中获取名为 "param_name" 的属性。
+    - 如果该属性不存在（例如，因为这个参数属于另一个子命令，在当前调用中未定义），它不会抛出 `AttributeError`，
+      而是返回一个 `default_value`（这里通常是 `None`）。
+    - 这使得我们可以编写一个通用的覆盖函数来处理所有子命令的共享参数，而无需担心哪些参数在当前上下文中是可用的。
+      代码变得更加简洁和可维护。
     """
     training = project.training
 
@@ -126,6 +135,7 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
     base_model_id = getattr(args, "base_model_id", None)
     if base_model_id:
         training.base_model_id = base_model_id
+    # 如果命令行参数存在，则使用它，否则保持 training 对象中的原值。
     training.base_model_path = getattr(
         args, "base_model_path", training.base_model_path
     )
@@ -168,6 +178,7 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
     )
 
     # --- 数据集相关覆盖 ---
+    # 检查是否存在与数据集相关的参数，如果存在，则调用 _load_dataset_mix 更新配置
     if hasattr(args, "dataset_config") or hasattr(args, "reasoning_source"):
         training.dataset_mix = _load_dataset_mix(args, training.dataset_mix)
     training.eval_split_ratio = getattr(
@@ -184,8 +195,10 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
     training.merge_dtype = getattr(args, "merge_dtype", training.merge_dtype)
 
     # --- GRPO 相关覆盖 ---
+    # 检查 with_grpo 标志，如果为 True，则启用 GRPO
     if hasattr(args, "with_grpo"):
         project.grpo.enable = args.with_grpo or project.grpo.enable
+    # 对于 GRPO 的参数，使用 `or` 链接默认值，确保即使命令行传入 0 或空字符串也能正确处理
     project.grpo.steps = (
         getattr(args, "grpo_steps", project.grpo.steps) or project.grpo.steps
     )
@@ -248,8 +261,8 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
 
 
 # --- 参数注册函数 ---
-# 将相关参数的定义封装在独立的函数中，使 `build_parser` 函数更清晰。
-
+# 将相关参数的定义封装在独立的函数中，使 `build_parser` 函数更清晰、更模块化。
+# 这种做法提高了代码的可读性和可维护性。
 
 def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     """注册与数据源相关的命令行参数."""
@@ -280,15 +293,17 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
         help="本地基础模型的路径",
     )
     parser.add_argument("--max-seq-length", type=int, default=4096, help="最大序列长度")
-    # `action="store_true"`: 当出现 `--load-in-4bit` 标志时，将 `load_in_4bit` 设为 True。
+    # `action="store_true"`: 这是一个布尔标志。当命令行出现 `--load-in-4bit` 标志时，
+    # argparse 会将 `load_in_4bit` 属性设为 True。如果标志不存在，则为 False。
     parser.add_argument(
         "--load-in-4bit",
         action="store_true",
         default=True,
         help="以4位模式加载模型 (默认启用)",
     )
-    # `dest` 和 `action="store_false"`: 当出现 `--no-4bit` 标志时，将 `load_in_4bit` 设为 False。
-    # `dest` 指定了要修改的目标变量名。
+    # `dest` 和 `action="store_false"`: 这是一种创建“否定”标志的技巧。
+    # 当命令行出现 `--no-4bit` 标志时，argparse 会将 `load_in_4bit` (`dest`指定的目标) 设为 False。
+    # 这比让用户输入 `--load-in-4bit False` 更直观。
     parser.add_argument(
         "--no-4bit", dest="load_in_4bit", action="store_false", help="禁用4位加载模式"
     )
@@ -300,7 +315,7 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_lora_args(parser: argparse.ArgumentParser) -> None:
     """注册 LoRA (低秩适配) 相关的参数."""
-    parser.add_argument("--lora-rank", type=int, default=64, help="LoRA 秩")
+    parser.add_argument("--lora-rank", type=int, default=64, help="LoRA 秩 (rank)")
     parser.add_argument(
         "--lora-alpha", type=int, default=64, help="LoRA alpha 缩放因子"
     )
@@ -324,7 +339,7 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
         "--num-train-epochs", type=float, default=1.0, help="总训练轮数"
     )
     parser.add_argument(
-        "--max-steps", type=int, default=-1, help="最大训练步数 (覆盖 epochs)"
+        "--max-steps", type=int, default=-1, help="最大训练步数 (若非-1，则覆盖 epochs)"
     )
     parser.add_argument("--logging-steps", type=int, default=10, help="日志记录步数")
     parser.add_argument("--eval-steps", type=int, default=50, help="评估步数")
@@ -337,22 +352,22 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
         "--output-dir",
         type=str,
         default="outputs/local_sft_big",
-        help="输出目录",
+        help="训练输出和检查点的根目录",
     )
     parser.add_argument(
-        "--experiment-name", type=str, default="qwen_math_tutor", help="实验名称"
+        "--experiment-name", type=str, default="qwen_math_tutor", help="实验名称，用于区分不同的运行"
     )
     parser.add_argument(
-        "--eval-split-ratio", type=float, default=0.02, help="验证集划分比例"
+        "--eval-split-ratio", type=float, default=0.02, help="从训练集中划分出的验证集比例"
     )
     parser.add_argument(
-        "--dataset-num-proc", type=int, default=1, help="数据预处理进程数"
+        "--dataset-num-proc", type=int, default=1, help="数据预处理时使用的进程数"
     )
     parser.add_argument(
         "--save-merged-model",
         action="store_true",
         default=True,
-        help="训练后保存合并后的模型 (默认启用)",
+        help="训练后自动将 LoRA 适配器与基础模型合并并保存 (默认启用)",
     )
     parser.add_argument(
         "--no-save-merged-model",
@@ -364,76 +379,79 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
         "--merge-dtype",
         type=str,
         default="fp16",
-        help="合并模型时的数据类型 (fp16, bf16, float)",
+        help="合并模型时使用的数据类型 (fp16, bf16, float)",
     )
 
 
 def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
     """注册 GRPO 阶段的特有参数。"""
-    parser.add_argument("--with-grpo", action="store_true")
-    parser.add_argument("--grpo-steps", type=int, default=500)
-    parser.add_argument("--grpo-learning-rate", type=float, default=8e-6)
-    parser.add_argument("--grpo-beta", type=float, default=0.2)
-    parser.add_argument("--grpo-kl", type=float, default=0.06)
-    parser.add_argument("--grpo-mini-batch", type=int, default=16)
-    parser.add_argument("--grpo-gradient-accumulation", type=int, default=1)
+    parser.add_argument("--with-grpo", action="store_true", help="在 SFT 后启用 GRPO 训练")
+    parser.add_argument("--grpo-steps", type=int, default=500, help="GRPO 训练的总步数")
+    parser.add_argument("--grpo-learning-rate", type=float, default=8e-6, help="GRPO 阶段的学习率")
+    parser.add_argument("--grpo-beta", type=float, default=0.2, help="GRPO 损失中的 beta 参数 (KL 散度权重)")
+    parser.add_argument("--grpo-kl", type=float, default=0.06, help="GRPO 的 KL 散度系数")
+    parser.add_argument("--grpo-mini-batch", type=int, default=16, help="GRPO 的 mini-batch 大小")
+    parser.add_argument("--grpo-gradient-accumulation", type=int, default=1, help="GRPO 的梯度累积步数")
     parser.add_argument(
         "--grpo-reference-free",
         dest="grpo_reference_free",
         action="store_true",
+        help="使用无参考模型的 GRPO 变体",
     )
     parser.add_argument(
         "--no-grpo-reference-free",
         dest="grpo_reference_free",
         action="store_false",
+        help="使用带参考模型的标准 GRPO",
     )
+    # `set_defaults` 用于为可能不出现的参数设置一个默认值，以避免 AttributeError。
     parser.set_defaults(grpo_reference_free=None)
     parser.add_argument(
         "--grpo-dataset",
         type=str,
         default=None,
-        help="Dataset for GRPO (HF repo or local file)",
+        help="用于 GRPO 的特定数据集 (HF 仓库或本地文件)",
     )
     parser.add_argument(
-        "--grpo-dataset-split", type=str, default=None, help="Split for GRPO dataset"
+        "--grpo-dataset-split", type=str, default=None, help="GRPO 数据集使用的数据切分 (如 'train')"
     )
     parser.add_argument(
         "--grpo-dataset-max-samples",
         type=int,
         default=None,
-        help="Optional cap on GRPO samples",
+        help="可选，限制 GRPO 数据集的最大样本数",
     )
     parser.add_argument(
         "--grpo-max-prompt-len",
         type=int,
         default=768,
-        help="Override max prompt tokens for GRPO generation",
+        help="覆盖 GRPO 生成阶段的最大 prompt token 数",
     )
     parser.add_argument(
         "--grpo-max-completion-len",
         type=int,
         default=2048,
-        help="Override max completion tokens for GRPO generation",
+        help="覆盖 GRPO 生成阶段的最大 completion token 数",
     )
     parser.add_argument(
         "--grpo-num-generations",
         type=int,
         default=2,
-        help="Override number of generations per prompt during GRPO",
+        help="在 GRPO 期间，每个 prompt 生成的响应数量",
     )
     parser.add_argument(
         "--grpo-save-steps",
         type=int,
         default=None,
-        help="Save GRPO checkpoints every N training steps",
+        help="每 N 个训练步数保存一次 GRPO 检查点",
     )
     parser.add_argument(
         "--grpo-max-tokens-per-step",
         type=int,
         default=None,
         help=(
-            "Soft upper bound on the estimated tokens per optimization step; when set,"
-            " the trainer will clip prompt/completion lengths to respect this budget."
+            "每个优化步骤的估计 token 数的软上限；设置后，"
+            "训练器将裁剪 prompt/completion 长度以遵守此预算。"
         ),
     )
 
@@ -442,21 +460,25 @@ def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _handle_train(args: argparse.Namespace) -> None:
-    """处理 `train` 子命令，执行 SFT，并按需衔接 GRPO."""
+    """处理 `train` 子命令，执行 SFT，并按需衔接 GRPO。"""
+    # 1. 创建一个默认的配置对象
     project = ProjectConfig()
+    # 2. 将命令行的参数覆盖到配置对象上
     _apply_common_overrides(project, args)
+    # 3. 运行监督微调 (SFT)
     metrics = run_sft_training(
         project, resume_from_checkpoint=args.resume_from_checkpoint
     )
     print("SFT 训练指标:", json.dumps(metrics, indent=2, default=str))
 
+    # 4. 如果配置中启用了 GRPO，则在 SFT 之后继续运行 GRPO
     if project.grpo.enable:
         grpo_metrics = run_grpo_training(project)
         print("GRPO 训练信息:", json.dumps(grpo_metrics, indent=2, default=str))
 
 
 def _handle_grpo(args: argparse.Namespace) -> None:
-    """处理 `grpo` 子命令，仅运行强化学习阶段."""
+    """处理 `grpo` 子命令，仅运行强化学习阶段。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
     project.grpo.enable = True  # 强制启用 GRPO
@@ -467,14 +489,17 @@ def _handle_grpo(args: argparse.Namespace) -> None:
 
 
 def _handle_evaluate(args: argparse.Namespace) -> None:
-    """处理 `evaluate` 子命令，对模型进行评估并输出统计信息."""
+    """处理 `evaluate` 子命令，对模型进行评估并输出统计信息。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
+    # 调用评估函数
     df = evaluate_model(
         project, model_path=args.model_path, sample_size=args.sample_size
     )
     print("评估结果描述性统计:")
+    # 使用 pandas 的 describe 方法快速获取统计摘要
     print(df.describe(include="all"))
+    # 如果指定了保存路径，则将结果保存为 Parquet 文件
     if args.save_path:
         save_path = Path(args.save_path)
         save_path.parent.mkdir(parents=True, exist_ok=True)
@@ -483,14 +508,14 @@ def _handle_evaluate(args: argparse.Namespace) -> None:
 
 
 def _handle_predict(args: argparse.Namespace) -> None:
-    """处理 `predict` 子命令，对给定的问题进行批量解答."""
+    """处理 `predict` 子命令，对给定的问题进行批量解答。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
 
     # 加载基础模型和分词器
     model, tokenizer = load_base_model(project.training, model_path=args.model_path)
 
-    # 如果提供了适配器路径，则加载 LoRA 权重
+    # 如果提供了适配器路径，则加载 LoRA 权重并应用到模型上
     if args.adapter_path:
         model = PeftModel.from_pretrained(model, args.adapter_path, is_trainable=False)
 
@@ -499,28 +524,29 @@ def _handle_predict(args: argparse.Namespace) -> None:
         args.question, system_prompt=project.evaluation.system_prompt
     )
 
-    # 准备模型以进行推理（例如，合并 LoRA 权重）
+    # 准备模型以进行推理（例如，合并 LoRA 权重，设置为评估模式等）
     prepare_for_inference(model)
 
-    # 生成答案
+    # 调用核心的生成函数
     outputs = generate_answers(
         model, tokenizer, prompts, max_new_tokens=args.max_new_tokens
     )
 
-    # 打印结果
+    # 格式化并打印结果
     for question, output in zip(args.question, outputs):
         print("\n=== 问题 ===\n", question)
         print("\n=== 回答 ===\n", output)
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """创建顶级的命令行解析器并注册所有子命令."""
+    """创建顶级的命令行解析器并注册所有子命令。"""
     parser = argparse.ArgumentParser(description="数学大模型微调命令行工具")
     # `add_subparsers` 用于创建子命令。`dest` 参数会将选中的子命令名称存储在 `command` 属性中。
+    # `required=True` 确保用户必须提供一个子命令。
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- 定义 'train' 子命令 ---
-    train_parser = subparsers.add_parser("train", help="运行监督微调 (SFT)")
+    train_parser = subparsers.add_parser("train", help="运行监督微调 (SFT)，可选择性地后跟 GRPO")
     _add_dataset_args(train_parser)
     _add_model_args(train_parser)
     _add_lora_args(train_parser)
@@ -531,11 +557,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     # `set_defaults(func=...)` 是一个关键技巧：它将一个函数与该子命令关联起来。
     # 当 `train` 命令被选中时，`argparse` 会在返回的 `Namespace` 对象中添加一个 `func` 属性，其值为 `_handle_train`。
+    # 这样，主函数 `main` 就可以通过 `args.func(args)` 来调用正确的处理函数。
     train_parser.set_defaults(func=_handle_train)
 
     # --- 定义 'grpo' 子命令 ---
     grpo_parser = subparsers.add_parser("grpo", help="仅运行 GRPO 强化学习阶段")
-    # 复用大部分与 train 命令相同的参数
+    # 复用大部分与 train 命令相同的参数，因为 GRPO 也需要模型、数据等配置
     _add_dataset_args(grpo_parser)
     _add_model_args(grpo_parser)
     _add_lora_args(grpo_parser)
@@ -545,7 +572,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--resume-from-checkpoint",
         type=str,
         default="outputs/local_sft_big/checkpoints/grpo/checkpoint-20",
-        help="从检查点恢复训练",
+        help="从 GRPO 检查点恢复训练",
     )
     grpo_parser.set_defaults(func=_handle_grpo)
 
@@ -554,13 +581,13 @@ def build_parser() -> argparse.ArgumentParser:
     _add_dataset_args(eval_parser)
     _add_model_args(eval_parser)
     eval_parser.add_argument(
-        "--sample-size", type=int, default=None, help="评估样本大小"
+        "--sample-size", type=int, default=None, help="评估样本大小 (默认使用全部)"
     )
     eval_parser.add_argument(
         "--model-path",
         type=str,
         default=None,
-        help="要评估的模型的路径 (可以是合并后的模型或 LoRA 适配器)",
+        help="要评估的模型的路径 (可以是合并后的模型或基础模型)",
     )
     eval_parser.add_argument(
         "--save-path", type=str, default=None, help="保存评估结果的 Parquet 文件路径"
@@ -574,7 +601,7 @@ def build_parser() -> argparse.ArgumentParser:
         "--model-path", type=str, default=None, help="基础模型的路径"
     )
     predict_parser.add_argument(
-        "--adapter-path", type=str, default=None, help="LoRA 适配器的路径"
+        "--adapter-path", type=str, default=None, help="LoRA 适配器的路径 (可选)"
     )
     predict_parser.add_argument(
         "--max-new-tokens", type=int, default=512, help="生成的最大 token 数"
@@ -590,10 +617,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
-    """项目 CLI 的主入口函数."""
+    """项目 CLI 的主入口函数。"""
     parser = build_parser()
     # 解析命令行参数。如果 `argv` 为 None，则 `argparse` 会自动使用 `sys.argv[1:]`。
+    # 传入 `argv` 的能力使得这个函数易于在测试中调用。
     args = parser.parse_args(list(argv) if argv is not None else None)
     # 调用与所选子命令关联的函数（通过 `set_defaults` 设置）。
-    # 这是 `argparse` 实现分发逻辑的推荐方式。
+    # 这是 `argparse` 实现分发逻辑的推荐方式，避免了大量的 if/elif/else 判断。
     args.func(args)

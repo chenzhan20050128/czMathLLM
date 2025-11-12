@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """数学大模型微调工具集 `czMathLLM` 的主入口。
 
-这个 `__init__.py` 文件是 `czMathLLM` 包的门面（facade），它定义了
+这个 `__init__.py` 文件是 `czMathLLM` 包的门面，它定义了
 该包的公共 API，并使用了一些技巧来优化导入性能。
 
 主要功能：
@@ -9,9 +9,8 @@
     确保其对 `transformers` 等库的运行时补丁能够尽早生效。
 2.  **提升核心配置类**: 从 `config` 模块中导入所有的数据类配置
     （如 `ProjectConfig`, `TrainingConfig` 等），使得用户可以直接
-    `from czMathLLM import ProjectConfig` 来使用它们。
-3.  **延迟加载 CLI**: 使用“延迟导入”（Late Import）模式来包装
-    `build_parser` 和 `main` 函数。这意味着，只有当这两个函数
+    `from czMathLLM import ProjectConfig` 来使Late Import）用它们。
+3.  **延迟加载 CLI**: 使用“延迟导入”。这意味着，只有当这两个函数
     被实际调用时，才会真正去导入重量级的 `cli_core` 模块。
     这对于希望以库（library）的形式使用 `czMathLLM` 的用户非常友好，
     因为他们可以只导入配置类而无需承担导入 `argparse` 等 CLI
@@ -23,7 +22,12 @@
 # 1. 确保 Unsloth 补丁优先应用
 # 再次强调，这个导入虽然看起来未使用，但其副作用是关键。
 import unsloth  # noqa: F401
-
+# ↑ 这一行代码执行时，unsloth 会：
+# 1. 修改 transformers 库的行为，优化训练性能
+# 2. 可能修改 torch 的某些操作
+# 3. 注册自定义的模型实现等
+# 后续代码可以享受 unsloth 带来的优化，但不需要直接调用它
+# 此时使用的 transformers 已经是经过 unsloth 优化的版本
 from typing import Any
 
 # 2. 提升核心配置类，使其成为包的顶层 API 的一部分。

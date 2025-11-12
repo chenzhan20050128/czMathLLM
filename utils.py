@@ -26,7 +26,8 @@ def set_global_seed(seed: int) -> None:
     如果不固定种子，每次运行代码时，像权重初始化、数据打乱、Dropout 等
     随机过程都会产生不同的结果，导致难以比较不同实验的效果。
 
-    这个函数确保了项目中的主要随机性来源都被统一控制。
+    这个函数确保了项目中的主要随机性来源都被统一控制，从而增强了实验的
+    科学性和可靠性。
     """
     # 设置 Python 内置的 random 模块的种子
     random.seed(seed)
@@ -34,7 +35,8 @@ def set_global_seed(seed: int) -> None:
     np.random.seed(seed)
     # 设置 PyTorch 在 CPU 上的随机种子
     torch.manual_seed(seed)
-    # 设置 PyTorch 在所有 GPU 上的随机种子
+    # 如果 CUDA 可用，则为所有 GPU 设置随机种子。
+    # `torch.cuda.manual_seed_all` 是一个幂等操作，如果 CUDA 不可用，它不会做任何事。
     torch.cuda.manual_seed_all(seed)
 
 
@@ -51,21 +53,26 @@ def dump_dataclass(obj: Any, path: Path) -> None:
     - `json.dump(...)`: 将字典写入 JSON 文件。
       - `indent=2`: 生成带 2 个空格缩进的、人类可读的 JSON 格式。
       - `ensure_ascii=False`: 允许直接写入非 ASCII 字符（如中文），
-        而不是将它们转义为 `\\uXXXX` 格式。
+        而不是将它们转义为 `\\uXXXX` 格式，提高了可读性。
+      - `default=str`: 这是一个回退函数。当 `json.dump` 遇到它不认识的
+        数据类型时（例如 `pathlib.Path` 对象），它会调用 `str()` 将该对象
+        转换为字符串，从而避免序列化错误。
     """
     if not is_dataclass(obj):
         raise TypeError("只能转储数据类（dataclass）的实例")
 
-    # 确保目标目录存在
+    # 确保目标目录存在，如果不存在则创建。
     path.parent.mkdir(parents=True, exist_ok=True)
 
+    # 将 dataclass 实例转换为字典
     payload: dict[str, Any] = asdict(obj)
 
+    # 使用 with 语句确保文件被正确关闭
     with path.open("w", encoding="utf-8") as f:
         json.dump(
             payload,
             f,
             indent=2,
             ensure_ascii=False,
-            default=str,
+            default=str, # 处理 Path 等非原生 JSON 类型
         )

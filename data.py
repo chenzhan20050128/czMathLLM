@@ -29,6 +29,7 @@ from .prompts import format_inference_prompt, format_sft_example
 # 不同的开源数据集对相同的概念（如“问题”、“答案”）可能有不同的命名。
 # 这里定义了一系列可能的字段名（keys），在处理数据时，会按顺序查找这些键，
 # 使用找到的第一个非空值，从而实现对多种数据源的兼容。
+# 这种做法极大地增强了代码的适应性，无需为每个新数据集编写专门的解析逻辑。
 QUESTION_KEYS = (
     "question", "prompt", "instruction", "problem", "input",
 )
@@ -46,10 +47,10 @@ FINAL_ANSWER_KEYS = (
 def _load_json_records(path: Path) -> list[dict[str, Any]]:
     """从 JSON 文件中读取记录，并确保返回一个字典列表。
 
-    该函数设计用于处理两种常见的 JSON 格式：
+    该函数设计用于处理两种常见的 JSON 格式，增强了鲁棒性：
     1.  文件内容本身就是一个 JSON 数组（`[...]`）。
     2.  文件内容是一个 JSON 对象，数据存储在 "data" 键下（`{"data": [...]}`）。
-    如果文件格式不符合预期，会抛出异常。
+    如果文件格式不符合预期，会抛出明确的 `ValueError` 或 `TypeError`。
     """
     with path.open("r", encoding="utf-8") as fh:
         data = json.load(fh)
@@ -67,9 +68,9 @@ def _load_json_records(path: Path) -> list[dict[str, Any]]:
 
 
 def _is_hidden(path: Path) -> bool:
-    """判断路径是否为隐藏文件或目录（以 `.` 开头）。
+    """判断路径是否为隐藏文件或目录（在 Unix-like 系统中以 `.` 开头）。
 
-    这在递归扫描目录时很有用，可以避免读取如 `.ipynb_checkpoints` 等无关文件。
+    这在递归扫描目录时很有用，可以避免读取如 `.ipynb_checkpoints`、`.DS_Store` 等无关文件。
     """
     return path.name.startswith(".")
 
@@ -77,31 +78,31 @@ def _is_hidden(path: Path) -> bool:
 def _load_local_dataset(path: Path) -> Dataset:
     """根据文件后缀或目录结构，动态地从本地加载数据集。
 
-    这个函数是本地数据加载的核心，它能智能地处理多种情况：
-    - 如果 `path` 是一个目录，它会递归地查找 `*.parquet`, `*.jsonl`, `*.json` 文件。
+    这个函数是本地数据加载的核心，它能智能地处理多种情况，体现了良好的工程实践：
+    - 如果 `path` 是一个目录，它会递归地查找 `*.parquet`, `*.jsonl`, `*.json` 文件，并按此优先级加载。
     - 如果 `path` 是一个文件，它会根据文件后缀（`.parquet`, `.jsonl`, `.json`）选择合适的加载方法。
     - `Path.rglob` 用于递归地搜索文件，非常方便。
     - `cast(Dataset, ...)`: 这是一个类型提示技巧。`Dataset.from_parquet` 等函数的返回值
-      类型在静态分析时可能不明确，`cast` 告诉类型检查器（如 mypy）：“相信我，我知道
-      这里的返回值一定是 `Dataset` 类型”，从而避免不必要的类型警告。
+      类型在静态分析时可能不明确（可能返回 `Dataset` 或 `DatasetDict`）。`cast` 告诉类型检查器（如 mypy）：
+      “相信我，我知道这里的返回值一定是 `Dataset` 类型”，从而避免不必要的类型警告。
     """
     if path.is_dir():
-        # 优先查找 Parquet 文件
+        # 优先查找 Parquet 文件，因为它通常性能更高
         parquet_files = tuple(str(p) for p in path.rglob("*.parquet") if not _is_hidden(p) and p.is_file())
         if parquet_files:
             return cast(Dataset, Dataset.from_parquet(list(parquet_files)))
 
-        # 其次查找 JSONL 文件
+        # 其次查找 JSONL 文件（每行一个 JSON 对象）
         jsonl_files = tuple(
             str(p)
-            for pattern in ("*.jsonl", "*.jsonl.gz")
+            for pattern in ("*.jsonl", "*.jsonl.gz") # 支持 .jsonl 和压缩的 .jsonl.gz
             for p in path.rglob(pattern)
             if not _is_hidden(p) and p.is_file()
         )
         if jsonl_files:
             return cast(Dataset, Dataset.from_json(list(jsonl_files)))
 
-        # 最后查找 JSON 文件
+        # 最后查找标准的 JSON 文件
         json_files = sorted(p for p in path.rglob("*.json") if not _is_hidden(p) and p.is_file())
         if json_files:
             records: list[dict[str, Any]] = []
@@ -109,7 +110,7 @@ def _load_local_dataset(path: Path) -> Dataset:
                 records.extend(_load_json_records(file_path))
             return Dataset.from_list(records)
 
-        raise ValueError(f"在 {path} 目录下未找到支持的数据文件")
+        raise ValueError(f"在 {path} 目录下未找到支持的数据文件 (parquet, jsonl, json)")
 
     # 如果 path 是单个文件
     suffix = path.suffix.lower()
@@ -127,8 +128,8 @@ def _load_local_dataset(path: Path) -> Dataset:
 def _first_non_empty(record: dict[str, Any], keys: Iterable[str]) -> Optional[str]:
     """在记录中按顺序查找 `keys` 列表，返回第一个找到的非空字符串值。
 
-    这是实现字段名标准化的关键辅助函数。它还处理了值为列表的情况，
-    将其中的非空字符串用换行符连接起来。
+    这是实现字段名标准化的关键辅助函数。它还优雅地处理了值为列表的情况，
+    将其中的非空字符串用换行符连接起来，增加了对多样化数据格式的兼容性。
     """
     for key in keys:
         value = record.get(key)
@@ -148,11 +149,11 @@ def _first_non_empty(record: dict[str, Any], keys: Iterable[str]) -> Optional[st
 
 
 def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
-    """将单个数据记录（字典）标准化。
+    """将单个数据记录（字典）标准化为包含 `question`, `answer`, `reasoning`, `final_answer` 的格式。
 
     主要工作：
-    1.  使用 `_first_non_empty` 和预定义的 `*_KEYS` 来提取 `question` 和 `answer`。
-    2.  如果 `reasoning` 字段缺失，则用 `answer` 字段填充。
+    1.  使用 `_first_non_empty` 和预定义的 `*_KEYS` 来提取 `question` 和 `answer`。这是数据清洗的核心。
+    2.  如果 `reasoning` 字段缺失，则用 `answer` 字段填充。这是一个合理的假设，即当没有明确的解题步骤时，整个答案可以被视为解题过程。
     3.  如果 `final_answer` 字段缺失，则调用 `_infer_final_answer` 从 `answer` 中推断。
     4.  返回一个包含 `question`, `answer`, `reasoning`, `final_answer` 四个标准字段的字典。
     """
@@ -162,7 +163,7 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
     final_answer = _first_non_empty(record, FINAL_ANSWER_KEYS)
 
     if not question or not answer:
-        raise ValueError("记录缺少 'question' 或 'answer' 字段")
+        raise ValueError(f"记录缺少 'question' 或 'answer' 字段: {record}")
 
     # 如果没有明确的推理过程，就假设整个答案都是推理过程。
     if not reasoning:
@@ -182,20 +183,22 @@ def _normalize_record(record: dict[str, Any]) -> dict[str, Any]:
 def _infer_final_answer(answer: str) -> str:
     """从答案文本中智能推断最终答案。
 
-    这是一个基于规则的启发式函数，按以下优先级尝试提取最终答案：
-    1.  查找 `\\boxed{...}`: 这是数学题解中标记最终答案的常见格式。
+    这是一个基于规则的启发式函数，它体现了对数学题解领域知识的运用。
+    按以下优先级尝试提取最终答案：
+    1.  查找 `\\boxed{...}`: 这是 LaTeX 中标记最终答案的常见格式，优先级最高。
     2.  查找 `Answer:`: 寻找 "Answer:" 标记并提取其后的内容。
     3.  查找 `最终答案`: 中文场景下的标记。
-    4.  使用最后一行: 如果以上都不匹配，则假设答案的最后非空行是最终答案。
-    5.  回退: 如果所有规则都失败，则返回整个答案文本。
+    4.  使用最后一行: 如果以上都不匹配，则假设答案的最后非空行是最终答案。这是一个通用的回退策略。
+    5.  回退: 如果所有规则都失败，则返回整个答案文本的清理版本。
     """
+    # `rfind` 从右侧开始查找，以处理答案中可能出现的多个 `\boxed`。
     marker = "\\boxed{"
     marker_idx = answer.rfind(marker)
     if marker_idx != -1:
         closing = answer.find("}", marker_idx + len(marker))
         if closing != -1:
             start = marker_idx + len(marker)
-            return answer[start:closing]
+            return answer[start:closing].strip()
     if "Answer:" in answer:
         return answer.split("Answer:")[-1].strip()
     if "最终答案" in answer:
@@ -207,10 +210,11 @@ def _infer_final_answer(answer: str) -> str:
 
 
 def _derive_metadata(normalized: dict[str, Any]) -> dict[str, Any]:
-    """根据标准化后的记录，派生出一些元数据（metadata）。
+    """根据标准化后的记录，派生出一些元数据（metadata）用于分析或高级训练。
 
-    这些元数据（如问题长度、难度、标签）可以用于数据分析，或者在更高级的
-    训练策略（如奖励建模）中作为输入特征。
+    这些元数据（如问题长度、难度、标签）可以用于数据分析，以了解数据集的构成；
+    或者在更高级的训练策略（如奖励建模）中作为输入特征，帮助模型判断答案质量。
+    这是一个简单的数据特征工程示例。
     """
     question = normalized["question"]
     reasoning = normalized["reasoning"]
@@ -219,7 +223,7 @@ def _derive_metadata(normalized: dict[str, Any]) -> dict[str, Any]:
     def _length(text: str) -> int:
         return len(text.split()) # 简单地以空格分割的单词数作为长度
 
-    # 基于关键词为问题打标签
+    # 基于关键词为问题打标签，进行简单的文本分类
     tags = []
     if any(keyword in question.lower() for keyword in ("prove", "show", "证明")):
         tags.append("proof")
@@ -250,6 +254,7 @@ def _normalize_dataset(dataset: Dataset) -> Dataset:
     """对整个 `datasets.Dataset` 对象进行标准化。
 
     它使用 `dataset.map` 方法将 `_normalize_record` 函数应用到数据集的每一行。
+    `map` 是 `datasets` 库的核心功能之一，可以高效地对数据进行并行处理。
     `remove_columns` 参数会移除所有非标准化的原始列，只保留 `question`, `answer`,
     `reasoning`, `final_answer`，保持数据集的整洁。
     """
@@ -267,7 +272,7 @@ def load_dataset_source(
     - 如果 `source.path` 存在，则调用 `_load_local_dataset` 从本地加载。
     - 否则，使用 `datasets.load_dataset` 从 Hugging Face Hub 下载。
     - 加载后，会调用 `_normalize_dataset` 进行标准化。
-    - 如果 `source.max_samples` 被设置，还会对数据集进行截断，方便快速调试。
+    - 如果 `source.max_samples` 被设置，还会对数据集进行截断，这对于在完整数据集上进行快速调试非常有用。
     """
     if source.path:
         dataset = _load_local_dataset(Path(source.path))
@@ -280,7 +285,7 @@ def load_dataset_source(
     if not source.name:
         raise ValueError("必须提供数据集名称或路径")
 
-    # 兼容 source.name 实际上是一个本地路径的情况
+    # 兼容 source.name 实际上是一个本地路径的情况，增加灵活性
     potential_path = Path(source.name)
     if potential_path.exists():
         dataset = _load_local_dataset(potential_path)
@@ -310,6 +315,7 @@ def _attach_metadata(dataset: Dataset) -> Dataset:
     def _add_metadata(example: dict[str, Any]) -> dict[str, Any]:
         return {"metadata": _derive_metadata(example)}
 
+    # `keep_in_memory=False` 建议 datasets 库在处理大数据时使用内存映射文件，避免内存溢出。
     return dataset.map(_add_metadata, keep_in_memory=False)
 
 
@@ -321,9 +327,10 @@ def build_sft_datasets(config: TrainingConfig, tokenizer) -> tuple[Dataset, Data
     2.  为每个数据集附加元数据。
     3.  使用 `format_sft_example` 将每个样本格式化为模型需要的 ChatML 格式文本。
         - 根据数据源的 `reasoning` 标志，决定是使用 `reasoning` 字段还是 `answer` 字段作为训练目标。
+          这允许我们混合训练“教过程”的数据和“教答案”的数据。
     4.  如果配置了多个数据集，使用 `interleave_datasets` 根据权重将它们混合成一个大数据集。
-        这是一种流式混合方法，可以避免将所有数据一次性加载到内存中。
-    5.  将混合后的数据集随机打乱。
+        这是一种流式混合方法，可以避免将所有数据一次性加载到内存中，对于处理大规模数据集至关重要。
+    5.  将混合后的数据集随机打乱 (`shuffle`) 以保证训练的随机性。
     6.  根据 `config.eval_split_ratio` 将数据集分割为训练集和验证集。
     """
     datasets = []
@@ -393,7 +400,7 @@ def build_grpo_dataset(
     - `reference`: 用于计算奖励的参考答案（通常是 `final_answer`）。
     - `metadata`: 可能影响奖励计算的元数据。
 
-    此函数负责完成这种格式转换。
+    此函数负责完成这种格式转换，通过 `map` 操作重构字典结构。
     """
     dataset = base_dataset
     if "metadata" not in dataset.column_names:
@@ -408,7 +415,7 @@ def build_grpo_dataset(
             "metadata": example.get("metadata", {}),
         }
 
-    # 只保留 GRPO 需要的列
+    # 只保留 GRPO 需要的列，保持数据整洁
     keep = {"question", "final_answer", "metadata"}
     columns_to_drop = [col for col in dataset.column_names if col not in keep]
 

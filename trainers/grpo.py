@@ -8,10 +8,11 @@ GRPO 是 DPO (Direct Preference Optimization) 的一种泛化，它允许在策�
 该模块的核心是 `run_grpo_training` 函数，它负责：
 1.  加载 SFT 阶段训练好的 LoRA 适配器作为初始策略模型。
 2.  （可选）加载一个参考模型（reference model），用于计算 KL 散度惩罚，
-    防止策略模型偏离初始状态太远。
-3.  准备 GRPO 训练所需的数据集，其格式与 SFT 不同。
+    防止策略模型偏离初始状态太远，从而保持生成质量。
+3.  准备 GRPO 训练所需的数据集，其格式与 SFT 不同，通常包含 `prompt` 和 `reference`。
 4.  将项目自定义的 `reward.py` 中的奖励函数包装成 `trl` 库期望的格式。
-5.  动态地构建 `GRPOConfig` 和 `GRPOTrainer` 的参数，以兼容不同版本的 `trl` 库。
+5.  动态地构建 `GRPOConfig` 和 `GRPOTrainer` 的参数，以兼容不同版本的 `trl` 库，
+    这是一个非常关键的健壮性设计。
 6.  执行训练并保存最终的模型。
 """
 
@@ -21,11 +22,12 @@ from __future__ import annotations
 import inspect
 from dataclasses import fields
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 from peft import PeftModel
 
 # 从 trl 库导入 GRPO 专用的配置类和训练器类。
+# TRL (Transformer Reinforcement Learning) 是 Hugging Face 提供的用于强化学习微调的库。
 from trl.trainer.grpo_config import GRPOConfig as HFGRPOConfig
 from trl.trainer.grpo_trainer import GRPOTrainer
 from transformers.trainer_callback import TrainerCallback
@@ -37,12 +39,14 @@ from ..reward import batch_reward
 from ..utils import set_global_seed, dump_dataclass
 
 
-TOKEN_WARNING_THRESHOLD = 160_000
-BASE_THROUGHPUT_TOK_PER_S = 320.0
-MAX_LOGGED_COMPLETION_CHARS = 4096
+# --- 常量定义 ---
+TOKEN_WARNING_THRESHOLD = 160_000  # 当单步 token 开销超过此阈值时发出警告
+BASE_THROUGHPUT_TOK_PER_S = 320.0  # 用于估算训练时间的基准吞吐量 (tokens/sec)
+MAX_LOGGED_COMPLETION_CHARS = 4096 # 日志中打印的最长 completion 字符数，防止日志过长
 
 
 class _RewardBuffer:
+    """一个用于在训练过程中缓冲和聚合奖励信息的辅助类."""
     def __init__(self, max_chars: int = MAX_LOGGED_COMPLETION_CHARS) -> None:
         self._records: list[tuple[str, str, float]] = []
         self._max_chars = max_chars
@@ -53,6 +57,7 @@ class _RewardBuffer:
         samples: list[str],
         rewards: list[float],
     ) -> None:
+        """记录一批奖励信息."""
         if not prompts or not samples or not rewards:
             return
         for prompt, sample, reward in zip(prompts, samples, rewards):
@@ -63,12 +68,14 @@ class _RewardBuffer:
             self._records.append((prompt, sample, reward_value))
 
     def flush(self, step: int) -> None:
+        """计算并打印缓冲的奖励统计信息，然后清空缓冲区."""
         if not self._records:
             return
 
         total_reward = sum(record[2] for record in self._records)
         count = len(self._records)
         avg_reward = total_reward / max(count, 1)
+        # 找到奖励最高的记录，用于展示
         best_prompt, best_sample, best_reward = max(
             self._records, key=lambda record: record[2]
         )
@@ -82,6 +89,7 @@ class _RewardBuffer:
         )
         print(message, flush=True)
 
+        # 对过长的样本进行截断，避免日志爆炸
         display_sample = best_sample
         truncated = False
         if len(display_sample) > self._max_chars:
@@ -106,18 +114,22 @@ class _RewardBuffer:
 
 
 class _RewardLoggingCallback(TrainerCallback):
+    """一个自定义的 `transformers.TrainerCallback`，用于在训练的特定阶段打印奖励信息."""
     def __init__(self, buffer: _RewardBuffer) -> None:
         self._buffer = buffer
 
     def on_step_end(self, args, state, control, **kwargs):
+        """在每个训练步骤结束时被调用."""
         self._buffer.flush(state.global_step)
 
     def on_train_end(self, args, state, control, **kwargs):
+        """在整个训练过程结束时被调用."""
         # 确保训练结束时残留的记录被输出。
         self._buffer.flush(state.global_step)
 
 
 def _format_int(value: int) -> str:
+    """将整数格式化为带千位分隔符的字符串，提高可读性."""
     return f"{value:,}"
 
 
@@ -127,7 +139,7 @@ def _apply_token_budget_once(
     workload: dict[str, int],
     budget: int,
 ) -> tuple[dict[str, int], bool]:
-    """Apply a single round of token budget clipping."""
+    """尝试通过裁剪 `max_completion_len` 或 `max_prompt_len` 来满足单步 token 预算."""
 
     updated = False
     effective_batch = workload["effective_batch"]
@@ -136,6 +148,7 @@ def _apply_token_budget_once(
     available_for_completions = budget - prompt_tokens
 
     if available_for_completions > 0 and completions_per_step > 0:
+        # 如果还有预算给 completion，则尝试裁剪 completion 长度
         raw_limit = available_for_completions // max(completions_per_step, 1)
         if raw_limit < 32:
             print(
@@ -152,6 +165,7 @@ def _apply_token_budget_once(
             grpo_cfg.max_completion_len = int(raw_limit)
             updated = True
     else:
+        # 如果连 prompt 的预算都不够，则尝试裁剪 prompt 长度
         prompt_limit = budget // max(effective_batch, 1)
         if prompt_limit < 64:
             print(
@@ -167,6 +181,7 @@ def _apply_token_budget_once(
             grpo_cfg.max_prompt_len = int(prompt_limit)
             updated = True
 
+    # 确保 prompt + completion 不超过模型的最大序列长度
     if (
         grpo_cfg.max_prompt_len + grpo_cfg.max_completion_len
         > training_cfg.max_seq_length
@@ -181,6 +196,7 @@ def _apply_token_budget_once(
             updated = True
 
     if updated:
+        # 如果配置被更新，重新计算工作负载
         return grpo_cfg.describe_workload(training_cfg), True
     return workload, False
 
@@ -190,6 +206,7 @@ def _apply_token_budget(
     grpo_cfg: GRPOConfig,
     workload: dict[str, int],
 ) -> dict[str, int]:
+    """循环应用 token 预算限制，直到满足预算或无法再裁剪."""
     budget = grpo_cfg.max_tokens_per_step
     if not budget or budget <= 0:
         return workload
@@ -206,6 +223,7 @@ def _apply_token_budget(
 
 
 def _log_workload(grpo_cfg: GRPOConfig, workload: dict[str, int]) -> None:
+    """打印 GRPO 训练的工作负载估算信息."""
     effective_batch = workload["effective_batch"]
     completions_per_step = workload["completions_per_step"]
     tokens_per_step = workload["tokens_per_step"]
@@ -216,28 +234,20 @@ def _log_workload(grpo_cfg: GRPOConfig, workload: dict[str, int]) -> None:
     mini_batch = grpo_cfg.mini_batch_size
     grad_accum = grpo_cfg.gradient_accumulation_steps
     print(
-        "[GRPO] 有效prompt批次 = "
-        f"{batch_info} (mini_batch={mini_batch}, "
-        f"grad_accum={grad_accum})"
+        f"[GRPO] 有效prompt批次 = {batch_info} (mini_batch={mini_batch}, grad_accum={grad_accum})"
     )
     print(
-        "        每step生成 "
-        f"{_format_int(completions_per_step)} 条completion "
-        f"(每prompt {grpo_cfg.num_generations_per_prompt} 条)。"
+        f"        每step生成 {_format_int(completions_per_step)} 条completion (每prompt {grpo_cfg.num_generations_per_prompt} 条)。"
     )
     print(
-        "[GRPO] 估算单step token 开销 ≈ "
-        f"{_format_int(tokens_per_step)} (prompt_len={prompt_len}, "
-        f"completion_len={completion_len})。"
+        f"[GRPO] 估算单step token 开销 ≈ {_format_int(tokens_per_step)} (prompt_len={prompt_len}, completion_len={completion_len})。"
     )
     if not grpo_cfg.reference_free:
         print("[GRPO] 当前启用了参考模型，logprob 计算将额外增加一次完整的前向传播。")
 
     if grpo_cfg.max_tokens_per_step:
         print(
-            "[GRPO] token预算设定为 "
-            f"{_format_int(grpo_cfg.max_tokens_per_step)}，"
-            f"估算开销 {_format_int(tokens_per_step)}。"
+            f"[GRPO] token预算设定为 {_format_int(grpo_cfg.max_tokens_per_step)}，估算开销 {_format_int(tokens_per_step)}。"
         )
 
     if (
@@ -246,14 +256,10 @@ def _log_workload(grpo_cfg: GRPOConfig, workload: dict[str, int]) -> None:
     ):
         approx_minutes = tokens_per_step / BASE_THROUGHPUT_TOK_PER_S / 60.0
         print(
-            "[GRPO][提示] 该配置预计每step耗时约 "
-            f"{approx_minutes:.1f} 分钟（按 "
-            f"{int(BASE_THROUGHPUT_TOK_PER_S)} tok/s 估算）。"
+            f"[GRPO][提示] 该配置预计每step耗时约 {approx_minutes:.1f} 分钟（按 {int(BASE_THROUGHPUT_TOK_PER_S)} tok/s 估算）。"
         )
         print(
-            "        若需更快迭代，可减小 --grpo-num-generations、"
-            "--grpo-max-completion-len、--grpo-mini-batch 或"
-            " --grpo-gradient-accumulation。"
+            "        若需更快迭代，可减小 --grpo-num-generations、--grpo-max-completion-len、--grpo-mini-batch 或 --grpo-gradient-accumulation。"
         )
 
 
@@ -262,7 +268,7 @@ def _reward_function(
     *,  # 强制后续参数为关键字参数
     references: list[str],
     metadatas: list[dict],
-    **_,
+    **_: Any, # 使用 `**_` 忽略其他所有未使用的关键字参数，增加函数的健壮性
 ) -> list[float]:
     """一个简单的包装函数，将项目内部的 `batch_reward` 函数连接到 TRL 训练器。
 
@@ -281,17 +287,16 @@ def run_grpo_training(
     """执行 GRPO 强化学习阶段，并返回训练统计信息。
 
     执行流程:
-    1.  **初始化**: 检查 GRPO 是否启用，并设置随机种子。
+    1.  **初始化**: 检查 GRPO 是否启用，保存配置，设置随机种子，并估算和打印工作负载。
     2.  **模型加载**:
-        - 加载基础模型。
-        - 从 SFT 阶段保存的目录 (`finetuned_model_dir`) 加载 LoRA 适配器，
+        - 加载基础模型和分词器。
+        - 从 SFT 阶段保存的目录 (`finetuned_model_dir`) 或指定的检查点加载 LoRA 适配器，
           并将其应用到基础模型上，得到 `peft_model`。这个模型是我们要优化的策略模型。
         - （可选）如果不是 `reference_free` 模式，则额外加载一个同样的模型作为
           `ref_model`，但其权重是冻结的，仅用于计算 KL 散度。
     3.  **数据准备**:
-        - 加载用于 GRPO 的源数据集。
-                - 使用 `build_grpo_dataset` 将其转换为包含 `prompt`,
-                    `reference`, `metadata` 的格式。
+        - 加载用于 GRPO 的源数据集。如果未指定，则复用 SFT 的训练集。
+        - 使用 `build_grpo_dataset` 将其转换为包含 `prompt`, `reference`, `metadata` 的格式。
         - 创建一个 `prompt_lookup` 字典，用于在奖励计算时根据 `prompt` 快速查找其对应的
           `reference` 和 `metadata`。
     4.  **奖励函数准备**: 定义一个闭包 `reward_fn`。这个函数在被 TRL 调用时，
@@ -302,7 +307,7 @@ def run_grpo_training(
           使用了 Python 的 `inspect` 和 `dataclasses.fields` 模块来动态检查
           `HFGRPOConfig` 和 `GRPOTrainer` 的构造函数需要哪些参数。
         - 然后，根据检查结果，动态地构建一个 `config_kwargs` 和 `trainer_kwargs` 字典，
-          只填充当前版本 `trl` 支持的参数。这是一种非常健壮的编程技巧。
+          只填充当前版本 `trl` 支持的参数。这是一种非常健壮的、面向未来的编程技巧。
     6.  **初始化并执行训练**: 创建 `GRPOTrainer` 实例并调用其 `train` 方法。
     7.  **保存模型**: 训练结束后，保存更新后的 LoRA 适配器，并（可选地）合并保存
         完整的模型。
@@ -327,6 +332,7 @@ def run_grpo_training(
     reward_buffer = _RewardBuffer()
 
     def _resolve_peft_dir() -> Path:
+        """智能地查找最新的、有效的 PEFT (LoRA) 适配器目录."""
         candidates: list[Path] = []
         finetuned_dir = Path(training_cfg.finetuned_model_dir)
         candidates.append(finetuned_dir)
@@ -347,6 +353,7 @@ def run_grpo_training(
                 continue
             seen.add(candidate)
             if (candidate / "adapter_config.json").exists():
+                print(f"[GRPO] 找到并使用 PEFT 适配器于: {candidate}")
                 return candidate
         raise FileNotFoundError(
             "未在输出目录或检查点中找到 adapter_config.json，"
@@ -400,6 +407,7 @@ def run_grpo_training(
 
     # 4. 奖励函数准备
     def reward_fn(*args, **_kwargs) -> list[float]:
+        """闭包，捕获 prompt_lookup 并将其传递给实际的奖励计算函数."""
         samples = _kwargs.pop("samples", None)
         prompts = _kwargs.pop("prompts", None)
         completions = _kwargs.pop("completions", None)
@@ -427,11 +435,13 @@ def run_grpo_training(
         reward_buffer.record(prompts, samples, rewards)
         return rewards
 
-    # `dataclasses.fields` 可动态枚举 HF 配置的字段，便于跨版本兼容。
+    # 5. 动态构建 HFGRPOConfig 参数
     grpo_output_dir = Path(training_cfg.checkpoints_dir) / "grpo"
     grpo_output_dir.mkdir(parents=True, exist_ok=True)
     config_kwargs = {}
     available_fields = {field.name for field in fields(HFGRPOConfig)}
+
+    # 这是一个非常健壮的设计：只填充当前 TRL 版本支持的参数
     if "learning_rate" in available_fields:
         config_kwargs["learning_rate"] = grpo_cfg.learning_rate
     if "beta" in available_fields:
@@ -483,16 +493,19 @@ def run_grpo_training(
         trainer_kwargs["ref_model"] = ref_model
     if "tokenizer" in trainer_sig.parameters:
         trainer_kwargs["tokenizer"] = tokenizer
+
+    # 动态确定奖励函数的参数名
     expects_reward_fn = "reward_fn" in trainer_sig.parameters
     expects_reward_function = "reward_function" in trainer_sig.parameters
     expects_reward_funcs = "reward_funcs" in trainer_sig.parameters
 
     if expects_reward_fn:
         trainer_kwargs["reward_fn"] = reward_fn
-    if expects_reward_function and not expects_reward_fn:
+    elif expects_reward_function:
         trainer_kwargs["reward_function"] = reward_fn
-    if expects_reward_funcs:
+    elif expects_reward_funcs:
         trainer_kwargs["reward_funcs"] = [reward_fn]
+
     if "args" in trainer_sig.parameters:
         trainer_kwargs["args"] = hf_config
     if "train_dataset" in trainer_sig.parameters:
@@ -510,7 +523,6 @@ def run_grpo_training(
     trainer.train(**train_kwargs)
 
     # 7. 保存模型
-    # GRPOTrainer 内部可能修改了模型，所以我们用 trainer.model
     final_model = trainer.model
     final_model.save_pretrained(str(training_cfg.finetuned_model_dir))
     tokenizer.save_pretrained(str(training_cfg.finetuned_model_dir))
