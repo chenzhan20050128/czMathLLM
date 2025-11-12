@@ -48,7 +48,7 @@ app = FastAPI(
     version="0.1.0",
 )
 
-ADMIN_PASSWORD = "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"
+ADMIN_PASSWORD = "--"
 DEFAULT_OUTPUT_ROOT = Path("outputs")
 DEFAULT_MODEL_ROOT = Path("models")
 SERVER_START_TS = time.time()
