@@ -1,3 +1,9 @@
+"""模型资源管理工具。
+
+该模块负责下载与缓存大模型权重，封装了镜像站点优先级、环境变量回退
+等细节。利用 Hugging Face Hub 的 `snapshot_download` 可以在保留文件
+结构的情况下增量更新模型，适合大文件的断点续传。"""
+
 from __future__ import annotations
 
 import os
@@ -11,6 +17,7 @@ from huggingface_hub.errors import (
     RepositoryNotFoundError,
 )
 
+# 默认存储目录支持通过环境变量覆盖；否则回退到项目根目录下的 `models/`。
 DEFAULT_MODELS_ROOT = Path(os.environ.get("MATH_LLM_MODELS", "models"))
 
 DEFAULT_PRIMARY_ENDPOINT = "https://hf-mirror.com"
@@ -27,6 +34,7 @@ os.environ.setdefault("HF_HUB_ENABLE_HF_TRANSFER", "1")
 
 
 def _strip_endpoint(endpoint: Optional[str]) -> Optional[str]:
+    """安全地剥离镜像地址两端的空白字符，并统一去掉末尾的 `/`。"""
     if not endpoint:
         return None
     endpoint = endpoint.strip()
@@ -36,12 +44,14 @@ def _strip_endpoint(endpoint: Optional[str]) -> Optional[str]:
 
 
 def _is_truthy(value: Optional[str]) -> bool:
+    """将字符串解析为布尔值，用于解析环境变量型开关。"""
     if value is None:
         return False
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _candidate_endpoints() -> list[Optional[str]]:
+    """根据环境变量给出候选的下载镜像列表，保证尝试顺序稳定。"""
     candidates: list[Optional[str]] = []
 
     env_primary = _strip_endpoint(
@@ -67,6 +77,7 @@ def _candidate_endpoints() -> list[Optional[str]]:
 
 
 def _safe_dir_name(model_id: str) -> str:
+    """将类似 ``Qwen/Qwen3`` 的模型标识映射为文件系统友好的目录名。"""
     return model_id.replace("/", "__")
 
 
@@ -76,6 +87,15 @@ def ensure_model(
     local_path: Optional[str] = None,
     force: bool = False,
 ) -> Path:
+    """确保本地存在指定模型并返回路径。
+
+    参数说明：
+    - ``model_id``：Hugging Face 仓库名或组织/仓库组合；
+    - ``local_path``：若提供则直接使用自定义路径；
+    - ``force``：为 ``True`` 时强制重新下载。
+
+    下载逻辑充分考虑了网络环境，按候选镜像顺序逐一尝试，
+    并在全部失败后抛出详细异常提示。"""
     if local_path:
         return Path(local_path)
 

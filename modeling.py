@@ -1,3 +1,9 @@
+"""模型加载与推理工具函数。
+
+注意：`unsloth` 必须优先导入，它会对 `transformers` 等库注入若干运行时补丁，
+以获得更快的 LoRA 微调体验。下方的函数主要封装了 tokenizer、基座模型、
+LoRA 权重的加载流程，并针对推理阶段做了轻量化设置。"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -14,6 +20,7 @@ from .assets import ensure_model
 
 
 def _resolve_model_reference(model_ref: Optional[str]) -> str:
+    """统一解析模型引用，支持本地路径与远端仓库。"""
     if model_ref is None:
         raise ValueError("Model reference cannot be None")
     path = Path(model_ref)
@@ -23,6 +30,10 @@ def _resolve_model_reference(model_ref: Optional[str]) -> str:
 
 
 def load_tokenizer(config: TrainingConfig):
+    """根据配置加载分词器。
+
+    若未显式指定 tokenizer，会默认沿用基座模型，并尝试补齐 ``pad_token``。
+    ``padding_side = "right"`` 可兼容大部分自回归模型的训练/推理。"""
     tokenizer_id = config.tokenizer_id or config.base_model_local_path()
     resolved_id = _resolve_model_reference(tokenizer_id)
     tokenizer = AutoTokenizer.from_pretrained(
@@ -41,6 +52,10 @@ def load_base_model(
     *,
     model_path: Optional[str] = None,
 ):
+    """加载基座模型并返回 `(model, tokenizer)` 二元组。
+
+    `FastLanguageModel.from_pretrained` 是 Unsloth 对原版 `AutoModel`
+    的封装，支持一键设置 4bit/8bit 量化、全参微调等高级选项。"""
     import os
 
     os.environ.setdefault("UNSLOTH_DISABLE_STATISTICS", "1")
@@ -60,6 +75,7 @@ def load_base_model(
 
 
 def prepare_lora_model(model, config: TrainingConfig):
+    """基于基座模型构建 LoRA 适配器。"""
     return FastLanguageModel.get_peft_model(
         model,
         r=config.lora_rank,
@@ -76,6 +92,10 @@ def prepare_lora_model(model, config: TrainingConfig):
 
 
 def _target_modules(model, config: TrainingConfig) -> Sequence[str]:
+    """指定需要插入 LoRA 权重的模块集合。
+
+    某些模型（如 Qwen3）会在权重中自带 `target_modules` 属性；
+    若不存在则使用常见的注意力投影层作为默认值。"""
     if hasattr(model, "target_modules"):
         return getattr(model, "target_modules")
     return (
@@ -90,6 +110,7 @@ def _target_modules(model, config: TrainingConfig) -> Sequence[str]:
 
 
 def ensure_precision() -> tuple[bool, bool]:
+    """检测当前硬件是否支持 bfloat16，返回 (use_fp16, use_bf16)。"""
     bf16_supported = is_bfloat16_supported()
     return not bf16_supported, bf16_supported
 
@@ -99,6 +120,10 @@ def merge_and_save(
     tokenizer,
     config: TrainingConfig,
 ) -> None:
+    """将 LoRA 权重合并回基座并保存。
+
+    当硬件支持 bfloat16 且用户选择 `merge_dtype="bf16"` 时，保存 bf16 精度，
+    否则默认使用 fp16，避免 dtype 不兼容导致加载失败。"""
     if not config.save_merged_model:
         return
     dtype = "fp16"
@@ -112,6 +137,7 @@ def merge_and_save(
 
 
 def prepare_for_inference(model) -> None:
+    """切换模型到推理模式，在 Unsloth 中会关闭多余的训练开关。"""
     FastLanguageModel.for_inference(model)
 
 
@@ -123,6 +149,11 @@ def generate_answers(
     max_new_tokens: int,
     device: Optional[str] = None,
 ) -> list[str]:
+    """批量生成答案。
+
+    该函数演示了 PyTorch Tensor ``to(device)`` 的惯用写法，以及如何利用
+    tokenizer 批量编码输入、调用 `model.generate`。返回值通过
+    ``batch_decode`` 解码为纯文本列表。"""
     if device is None:
         device = "cuda" if torch.cuda.is_available() else "cpu"
     FastLanguageModel.for_inference(model)

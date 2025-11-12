@@ -1,4 +1,7 @@
-"""Math fine-tuning toolkit built on top of Unsloth and TRL."""
+"""数学大模型微调工具集。
+
+封装了监督微调（SFT）、GRPO 强化学习、离线评估等完整流程，
+依赖 Unsloth 与 Hugging Face TRL 实现高效的 LoRA 训练。"""
 
 import unsloth  # noqa: F401  # ensure Unsloth patches are applied early
 

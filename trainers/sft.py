@@ -1,3 +1,8 @@
+"""监督微调（SFT）训练脚本。
+
+依赖 Hugging Face `trl` 库提供的 `SFTTrainer`，并结合 Unsloth 优化的
+模型加载流程。该模块展示了如何把项目中的配置、数据构建与训练器衔接。"""
+
 from __future__ import annotations
 
 from pathlib import Path
@@ -21,6 +26,7 @@ def run_sft_training(
     *,
     resume_from_checkpoint: Optional[str] = None,
 ) -> dict:
+    """执行监督微调流程，并返回训练指标字典。"""
     project.ensure_directories()
     training_cfg = project.training
     set_global_seed(training_cfg.random_seed)
@@ -31,6 +37,7 @@ def run_sft_training(
     train_dataset, eval_dataset = build_sft_datasets(training_cfg, tokenizer)
     _, bf16_supported = ensure_precision()
 
+    # ``dict(...)`` 会基于关键字参数构建字典，方便后续条件更新。
     args_dict: dict[str, Any] = dict(
         per_device_train_batch_size=training_cfg.micro_batch_size,
         gradient_accumulation_steps=training_cfg.gradient_accumulation_steps,
@@ -57,6 +64,7 @@ def run_sft_training(
     if (
         "evaluation_strategy" in SFTConfig.__init__.__code__.co_varnames
     ):  # type: ignore[attr-defined]
+        # 兼容不同版本 `trl` 的参数命名：新版使用 `evaluation_strategy`。
         args_dict["evaluation_strategy"] = args_dict.pop("eval_strategy")
 
     training_args = SFTConfig(**args_dict)
@@ -71,6 +79,7 @@ def run_sft_training(
         max_seq_length=training_cfg.max_seq_length,
     )
 
+    # ``train`` 方法返回 `TrainOutput`，其中包含损失、步数等统计信息。
     train_result = trainer.train(resume_from_checkpoint=resume_from_checkpoint)
     metrics = {**train_result.metrics}
 

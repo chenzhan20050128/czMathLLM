@@ -1,3 +1,12 @@
+"""基于 TRL 的 GRPO（Group Relative Policy Optimization）训练脚本。
+
+GRPO 是强化学习阶段的一种策略梯度方法，支持对同一条 prompt 生成多条
+样本并相互比较得分。此模块主要负责：
+
+1. 载入 LoRA 适配器与参考模型；
+2. 构造奖励函数，将项目自定义的 `batch_reward` 注入 TRL；
+3. 动态适配不同版本 TRL 的配置/初始化签名。"""
+
 from __future__ import annotations
 
 import inspect
@@ -22,6 +31,7 @@ def _reward_function(
     metadatas,
     **_,
 ) -> list[float]:  # type: ignore[override]
+    """包装项目级奖励函数，符合 TRL 对回调签名的要求。"""
     return batch_reward(samples, references, metadatas)
 
 
@@ -30,6 +40,7 @@ def run_grpo_training(
     *,
     resume_from_checkpoint: Optional[str] = None,
 ) -> dict:
+    """执行 GRPO 强化学习阶段，并返回训练统计信息。"""
     training_cfg = project.training
     grpo_cfg = project.grpo
 
@@ -44,6 +55,7 @@ def run_grpo_training(
         training_cfg.finetuned_model_dir,
         is_trainable=True,
     )
+    # 某些 PEFT 版本需要显式开启输入梯度，方便低秩权重参与优化。
     enable_input_grads = getattr(
         peft_model,
         "enable_input_require_grads",
@@ -98,6 +110,7 @@ def run_grpo_training(
             metas.append(metadata)
         return _reward_function(samples, references=refs, metadatas=metas)
 
+    # `dataclasses.fields` 可动态枚举 HF 配置的字段，便于跨版本兼容。
     config_kwargs = {}
     available_fields = {field.name for field in fields(HFGRPOConfig)}
     if "learning_rate" in available_fields:

@@ -1,4 +1,10 @@
 # flake8: noqa
+"""命令行入口的核心实现。
+
+将 ``argparse`` 解析出的参数转换为项目配置对象，并根据子命令执行
+训练、评估或推理。为了降低首次导入开销，真正的入口函数放在
+``__init__.py`` 中进行延迟加载。"""
+
 from __future__ import annotations
 
 import argparse
@@ -18,6 +24,7 @@ from .trainers import run_grpo_training, run_sft_training
 def _load_dataset_mix(
     args, default_mix: Iterable[DatasetSource]
 ) -> tuple[DatasetSource, ...]:
+    """根据命令行参数生成数据源组合。"""
     if args.dataset_config:
         config_path = Path(args.dataset_config)
         with config_path.open("r", encoding="utf-8") as fh:
@@ -50,6 +57,7 @@ def _load_dataset_mix(
 
 
 def _parse_source_arg(arg: Optional[str]) -> Optional[dict]:
+    """解析数据源字符串，可接受路径、``repo:subset`` 或仓库名。"""
     if arg is None:
         return None
     if arg.lower() in {"none", ""}:
@@ -66,6 +74,7 @@ def _parse_source_arg(arg: Optional[str]) -> Optional[dict]:
 
 
 def _apply_common_overrides(project: ProjectConfig, args) -> None:
+    """将命令行覆盖项映射到项目配置对象上。"""
     training = project.training
     base_model_id = getattr(args, "base_model_id", None)
     if base_model_id:
@@ -168,6 +177,7 @@ def _apply_common_overrides(project: ProjectConfig, args) -> None:
 
 
 def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
+    """注册与数据源相关的命令行参数。"""
     parser.add_argument(
         "--dataset-config", type=str, help="Path to JSON defining dataset mix"
     )
@@ -184,6 +194,7 @@ def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
+    """注册模型加载相关参数。"""
     parser.add_argument("--base-model-id", type=str, default=None)
     parser.add_argument("--base-model-path", type=str, default=None)
     parser.add_argument("--max-seq-length", type=int, default=4096)
@@ -194,12 +205,14 @@ def _add_model_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_lora_args(parser: argparse.ArgumentParser) -> None:
+    """注册 LoRA 低秩适配相关参数。"""
     parser.add_argument("--lora-rank", type=int, default=64)
     parser.add_argument("--lora-alpha", type=int, default=64)
     parser.add_argument("--lora-dropout", type=float, default=0.05)
 
 
 def _add_train_args(parser: argparse.ArgumentParser) -> None:
+    """注册训练阶段的超参数选项。"""
     parser.add_argument("--micro-batch-size", type=int, default=1)
     parser.add_argument("--gradient-accumulation-steps", type=int, default=16)
     parser.add_argument("--learning-rate", type=float, default=2e-5)
@@ -224,6 +237,7 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
+    """注册 GRPO 阶段的特有参数。"""
     parser.add_argument("--with-grpo", action="store_true")
     parser.add_argument("--grpo-steps", type=int, default=None)
     parser.add_argument("--grpo-learning-rate", type=float, default=None)
@@ -250,6 +264,7 @@ def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
 
 
 def _handle_train(args: argparse.Namespace) -> None:
+    """处理 ``train`` 子命令，执行 SFT，并按需衔接 GRPO。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
     metrics = run_sft_training(
@@ -263,6 +278,7 @@ def _handle_train(args: argparse.Namespace) -> None:
 
 
 def _handle_grpo(args: argparse.Namespace) -> None:
+    """处理 ``grpo`` 子命令，仅运行强化学习阶段。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
     project.grpo.enable = True
@@ -273,6 +289,7 @@ def _handle_grpo(args: argparse.Namespace) -> None:
 
 
 def _handle_evaluate(args: argparse.Namespace) -> None:
+    """处理 ``evaluate`` 子命令，输出统计信息并可选择保存结果。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
     df = evaluate_model(
@@ -285,6 +302,7 @@ def _handle_evaluate(args: argparse.Namespace) -> None:
 
 
 def _handle_predict(args: argparse.Namespace) -> None:
+    """处理 ``predict`` 子命令，实现批量问题解答。"""
     project = ProjectConfig()
     _apply_common_overrides(project, args)
     model, tokenizer = load_base_model(project.training, model_path=args.model_path)
@@ -303,6 +321,7 @@ def _handle_predict(args: argparse.Namespace) -> None:
 
 
 def build_parser() -> argparse.ArgumentParser:
+    """创建顶级命令行解析器并注册各子命令。"""
     parser = argparse.ArgumentParser(description="Math fine-tuning CLI")
     subparsers = parser.add_subparsers(dest="command", required=True)
 
@@ -346,6 +365,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Optional[Iterable[str]] = None) -> None:
+    """项目 CLI 主入口。"""
     parser = build_parser()
     args = parser.parse_args(list(argv) if argv is not None else None)
     args.func(args)
