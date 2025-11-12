@@ -1,25 +1,48 @@
-"""提示词模板工具。
+# -*- coding: utf-8 -*-
+"""提示词（Prompt）工程相关的模板和工具函数。
 
-定义了 ChatML 风格的系统提示词、训练样本格式化函数等，
-便于在 SFT/推理阶段保持一致的输入格式。"""
+该模块集中管理了项目中使用的所有提示词格式，确保在训练、评估和推理等
+不同阶段，模型接收到的输入格式保持一致。这对于模型的性能和稳定性至关重要。
+这里主要采用了 Qwen 系列模型推荐的 ChatML 格式。
+"""
 
+# from __future__ import annotations: 同样是为了支持延迟解析类型注解。
 from __future__ import annotations
 
+# `textwrap.dedent` 是一个非常实用的小工具，用于去除多行字符串中每一行
+# 开头的公共空白。这使得我们可以在代码中以整洁、缩进的方式定义多行字符串，
+# 而最终得到的字符串不会包含这些多余的缩进。
 from textwrap import dedent
 from typing import Iterable
 
+# --- 默认系统提示 ---
+# 定义一个默认的系统提示（System Prompt）。系统提示是在对话开始前给模型的
+# 一个高级指令，用于设定模型的角色、行为准则和输出风格。
 DEFAULT_SYSTEM_PROMPT = dedent(
     """
-    You are an experienced mathematics tutor who explains concepts clearly,
-    validates intermediate steps, and always concludes with a boxed final
-    answer when appropriate. Encourage learners, highlight important formulas,
-    and use LaTeX for math expressions.
+    你是一位经验丰富的数学导师，能够清晰地解释概念，验证中间步骤，
+    并在适当时总是用 `\\boxed{}` 框出最终答案。鼓励学习者，
+    突出重要的公式，并使用 LaTeX 来表示数学表达式。
     """
-).strip()
+).strip() # .strip() 用于移除字符串开头和结尾的空白（包括 dedent 后的换行符）。
 
 
 def build_chat_prompt(question: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT) -> str:
-    """构造符合 Qwen ChatML 规范的对话模板。"""
+    """构造符合 Qwen 系列模型 ChatML 规范的对话模板。
+
+    ChatML 是一种用特殊标记来区分不同角色（如 system, user, assistant）
+    的对话格式。一个典型的 ChatML 示例如下：
+    <|im_start|>system
+    You are a helpful assistant.
+    <|im_end|>
+    <|im_start|>user
+    Hello!
+    <|im_end|>
+    <|im_start|>assistant
+
+    这个函数就是将系统提示和用户问题（question）组装成这种格式，
+    并以 `<|im_start|>assistant\n` 结尾，引导模型开始生成助手的回答。
+    """
     return (
         "<|im_start|>system\n"
         f"{system_prompt}\n"
@@ -32,13 +55,23 @@ def build_chat_prompt(question: str, system_prompt: str = DEFAULT_SYSTEM_PROMPT)
 
 
 def format_sft_example(question: str, answer: str, *, eos_token: str) -> str:
-    """将问答拼接为训练集样本。
+    """将一个（问题，答案）对格式化为一条监督微调（SFT）的训练样本。
 
-    - 末尾补上 ``eos_token``，确保模型知道何时停止；
-    - 若答案中出现 ``<think>`` 却没有 ``</think>``，则自动补齐闭合标签。
+    SFT 的训练数据通常是一整个完整的对话回合，即 "提示 + 回答"。
+    这个函数将 `question` 和 `answer` 拼接成一个完整的 ChatML 格式字符串。
+
+    关键操作：
+    - 使用 `build_chat_prompt` 生成对话的 "system" 和 "user" 部分。
+    - 将模型的期望输出 `answer` 附加在后面。
+    - 在最末尾添加 `eos_token` (End-Of-Sequence token)，这是一个特殊标记，
+      它告诉模型一句话或一个段落到这里就结束了。在训练时，这有助于模型
+      学会适时地停止生成。
+    - 包含一个小的健壮性处理：如果答案中包含了 `<think>` 标签但没有闭合，
+      则自动补全 `</think>`，防止格式错误。
     """
     prompt = build_chat_prompt(question)
-    cleaned_answer = answer.rstrip()
+    cleaned_answer = answer.rstrip() # 移除答案末尾的空白
+    # 这是一个小的容错处理，确保 <think> 标签总是成对出现。
     if not cleaned_answer.endswith("</think>") and "<think>" in cleaned_answer:
         cleaned_answer += "</think>"
     return f"{prompt}{cleaned_answer}{eos_token}"
@@ -47,14 +80,23 @@ def format_sft_example(question: str, answer: str, *, eos_token: str) -> str:
 def format_inference_prompt(
     question: str, *, system_prompt: str = DEFAULT_SYSTEM_PROMPT
 ) -> str:
-    """推理专用的 prompt 构造函数，主要是保持接口统一。"""
+    """为推理（Inference）阶段构造提示词。
 
+    在推理时，我们只需要提供对话的上下文（system 和 user 的部分），
+    然后让模型来生成 `assistant` 的部分。因此，这个函数本质上只是
+    `build_chat_prompt` 的一个简单封装，以保持 API 接口的统一性。
+    """
     return f"{build_chat_prompt(question, system_prompt=system_prompt)}"
 
 
 def batched_prompts(
     questions: Iterable[str], *, system_prompt: str = DEFAULT_SYSTEM_PROMPT
 ) -> list[str]:
-    """批量生成 prompt，供推理或评估阶段直接使用。"""
+    """为一批问题批量生成推理用的提示词。
 
+    这是一个便利函数，它接收一个问题列表，然后对列表中的每个问题调用
+    `format_inference_prompt`，最后返回一个提示词字符串的列表。
+    这在批量评估或批量推理的场景下非常有用。
+    """
+    # 使用列表推导式（list comprehension）高效地完成批量转换。
     return [format_inference_prompt(q, system_prompt=system_prompt) for q in questions]
