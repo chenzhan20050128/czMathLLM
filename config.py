@@ -15,7 +15,8 @@ DEFAULT_BASE_MODEL_PATH = (
 
 _LOCAL_DATA_DIR = _PROJECT_ROOT / "data"
 _OPEN_MATH_LOCAL = _LOCAL_DATA_DIR / "OpenMathReasoning" / "data"
-_DAPO_LOCAL = _LOCAL_DATA_DIR / "DAPO-Math-17k-Processed" / "all"
+_DAPO_ROOT = _LOCAL_DATA_DIR / "DAPO-Math-17k-Processed"
+_DAPO_LOCAL = _DAPO_ROOT / "all"
 
 
 def _default_dataset_mix() -> tuple[DatasetSource, ...]:
@@ -51,8 +52,8 @@ def _default_dataset_mix() -> tuple[DatasetSource, ...]:
 
 
 def _default_grpo_dataset() -> DatasetSource:
-    if _OPEN_MATH_LOCAL.exists():
-        return DatasetSource(path=str(_OPEN_MATH_LOCAL), reasoning=True)
+    if _DAPO_ROOT.exists():
+        return DatasetSource(path=str(_DAPO_ROOT), reasoning=True)
     return DatasetSource(
         name="open-r1/DAPO-Math-17k-Processed",
         subset="en",
@@ -150,17 +151,17 @@ class GRPOConfig:
 
     enable: bool = True
     steps: int = 500
-    learning_rate: float = 5e-6
+    learning_rate: float = 8e-6
     beta: float = 0.2
     clip_range: float = 0.2
-    kl_coef: float = 0.02
+    kl_coef: float = 0.06
     value_loss_coef: float = 0.01
     mini_batch_size: int = 2
     gradient_accumulation_steps: int = 8
     num_generations_per_prompt: int = 1
     max_prompt_len: int = 2048
-    max_completion_len: int = 512
-    reward_temperature: float = 0.9
+    max_completion_len: int = 1024  # 之前768 有98%的数据被截断
+    reward_temperature: float = 1.0
     reference_free: bool = False
     mixed_precision: Optional[str] = "bf16"
     save_steps: int = 100

@@ -44,6 +44,14 @@ def run_grpo_training(
         training_cfg.finetuned_model_dir,
         is_trainable=True,
     )
+    enable_input_grads = getattr(
+        peft_model,
+        "enable_input_require_grads",
+        None,
+    )
+    if callable(enable_input_grads):
+        enable_input_grads()
+    peft_model.train()
 
     ref_model = None
     if not grpo_cfg.reference_free:
@@ -98,6 +106,8 @@ def run_grpo_training(
         config_kwargs["beta"] = grpo_cfg.beta
     if "mini_batch_size" in available_fields:
         config_kwargs["mini_batch_size"] = grpo_cfg.mini_batch_size
+    if "per_device_train_batch_size" in available_fields:
+        config_kwargs["per_device_train_batch_size"] = grpo_cfg.mini_batch_size
     if "gradient_accumulation_steps" in available_fields:
         config_kwargs["gradient_accumulation_steps"] = (
             grpo_cfg.gradient_accumulation_steps
@@ -124,6 +134,8 @@ def run_grpo_training(
         )
 
     hf_config = HFGRPOConfig(**config_kwargs)
+    if hasattr(hf_config, "max_steps"):
+        setattr(hf_config, "max_steps", grpo_cfg.steps)
     if not hasattr(hf_config, "unsloth_num_chunks"):
         setattr(hf_config, "unsloth_num_chunks", -1)
 
