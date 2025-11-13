@@ -10,7 +10,6 @@ venv/
 .idea/
 .vscode/
 .DS_Store
-*.log
 *.tmp
 *.temp
 someDataCz/checkpoint-320/adapter_model.safetensors
