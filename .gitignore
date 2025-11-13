@@ -13,3 +13,5 @@ venv/
 *.log
 *.tmp
 *.temp
+someDataCz/checkpoint-320/adapter_model.safetensors
+someDataCz/checkpoint-320/optimizer.pt
