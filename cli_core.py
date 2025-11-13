@@ -10,8 +10,6 @@
 调用，从而实现延迟加载，避免在不必要时导入重量级的深度学习库。
 """
 
-# from __future__ import annotations: 同样是为了支持延迟解析类型注解。
-# 在 Python 3.10+ 中，类型注解可以在定义前使用，此导入是为了向前兼容。
 from __future__ import annotations
 
 import argparse
@@ -19,11 +17,16 @@ import json
 from pathlib import Path
 from typing import Iterable, Optional
 
-# PeftModel 用于加载和应用 PEFT（Parameter-Efficient Fine-Tuning）适配器，如 LoRA。
 from peft import PeftModel
 
-# 导入项目内部的配置类、评估函数、模型加载函数、提示词处理工具和训练器。
-from .config import DatasetSource, ProjectConfig
+# 引入所有需要的配置与常量（单一默认值来源）
+from .config import (
+    DatasetSource,
+    ProjectConfig,
+    MAX_SEQ_LENGTH_DEFAULT,
+    REASONING_DATASET_DEFAULT_WEIGHT,
+    INSTRUCTION_DATASET_DEFAULT_WEIGHT,
+)
 from .evaluation import evaluate_model
 from .modeling import generate_answers, load_base_model, prepare_for_inference
 from .prompts import batched_prompts
@@ -53,29 +56,34 @@ def _load_dataset_mix(
         # 这是一个非常 Pythonic 的写法，简洁地将字典数据映射到 Pydantic 模型实例。
         return tuple(DatasetSource(**entry) for entry in data)
 
-    # 解析推理和指令数据集的参数。
-    reasoning_source = _parse_source_arg(args.reasoning_source)
-    instruction_source = _parse_source_arg(args.instruction_source)
+    reasoning_source = _parse_source_arg(getattr(args, "reasoning_source", None))
+    instruction_source = _parse_source_arg(getattr(args, "instruction_source", None))
 
-    mix = []
+    mix: list[DatasetSource] = []
     if reasoning_source:
         mix.append(
             DatasetSource(
                 **reasoning_source,
-                weight=args.reasoning_weight,
-                reasoning=True,  # 标记为推理数据集
+                weight=(
+                    args.reasoning_weight
+                    if getattr(args, "reasoning_weight", None) is not None
+                    else REASONING_DATASET_DEFAULT_WEIGHT
+                ),
+                reasoning=True,
             )
         )
     if instruction_source:
         mix.append(
             DatasetSource(
                 **instruction_source,
-                weight=args.instruction_weight,
-                reasoning=False,  # 标记为指令数据集
+                weight=(
+                    args.instruction_weight
+                    if getattr(args, "instruction_weight", None) is not None
+                    else INSTRUCTION_DATASET_DEFAULT_WEIGHT
+                ),
+                reasoning=False,
             )
         )
-
-    # 如果 mix 列表为空（即命令行未指定任何数据源），则使用默认值。
     if not mix:
         mix = list(default_mix)
     return tuple(mix)
@@ -97,22 +105,25 @@ def _parse_source_arg(arg: Optional[str]) -> Optional[dict]:
         return None
     if arg.lower() in {"none", ""}:
         return None
-
     path_candidate = Path(arg)
     if path_candidate.exists():
         return {"path": str(path_candidate)}
-
-    # 启发式地判断是否为文件路径（即使文件当前不存在），这在某些部署场景下很有用。
     if any(arg.endswith(ext) for ext in (".json", ".jsonl", ".jsonl.gz", ".parquet")):
         return {"path": arg}
-
-    # 如果包含冒号，则解析为 "仓库名:子集名" 的格式
     if ":" in arg:
         name, subset = arg.split(":", 1)
         return {"name": name, "subset": subset}
-
-    # 默认情况下，将其视为一个 Hugging Face 仓库名
     return {"name": arg}
+
+
+def _maybe_parse_csv_floats(value: Optional[str]) -> Optional[list[float]]:
+    if value is None:
+        return None
+    parts = [p.strip() for p in str(value).split(",") if str(p).strip()]
+    try:
+        return [float(p) for p in parts]
+    except Exception:
+        return None
 
 
 def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) -> None:
@@ -132,327 +143,348 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
     training = project.training
 
     # --- 模型相关覆盖 ---
-    base_model_id = getattr(args, "base_model_id", None)
-    if base_model_id:
-        training.base_model_id = base_model_id
-    # 如果命令行参数存在，则使用它，否则保持 training 对象中的原值。
-    training.base_model_path = getattr(
-        args, "base_model_path", training.base_model_path
-    )
-    training.max_seq_length = getattr(args, "max_seq_length", training.max_seq_length)
-    training.load_in_4bit = getattr(args, "load_in_4bit", training.load_in_4bit)
-    training.load_in_8bit = getattr(args, "load_in_8bit", training.load_in_8bit)
-    training.full_finetuning = getattr(
-        args, "full_finetuning", training.full_finetuning
-    )
+    if getattr(args, "base_model_id", None) is not None:
+        training.base_model_id = args.base_model_id
+    if getattr(args, "base_model_path", None) is not None:
+        training.base_model_path = args.base_model_path
+    if getattr(args, "max_seq_length", None) is not None:
+        training.max_seq_length = args.max_seq_length
+    if getattr(args, "load_in_4bit", None) is not None:
+        training.load_in_4bit = args.load_in_4bit
+    if getattr(args, "load_in_8bit", None) is not None:
+        training.load_in_8bit = args.load_in_8bit
+    if getattr(args, "full_finetuning", None) is not None:
+        training.full_finetuning = args.full_finetuning
 
     # --- LoRA 相关覆盖 ---
-    training.lora_rank = getattr(args, "lora_rank", training.lora_rank)
-    training.lora_alpha = getattr(args, "lora_alpha", training.lora_alpha)
-    training.lora_dropout = getattr(args, "lora_dropout", training.lora_dropout)
+    if getattr(args, "lora_rank", None) is not None:
+        training.lora_rank = args.lora_rank
+    if getattr(args, "lora_alpha", None) is not None:
+        training.lora_alpha = args.lora_alpha
+    if getattr(args, "lora_dropout", None) is not None:
+        training.lora_dropout = args.lora_dropout
 
     # --- 训练过程相关覆盖 ---
-    training.gradient_accumulation_steps = getattr(
-        args, "gradient_accumulation_steps", training.gradient_accumulation_steps
-    )
-    training.micro_batch_size = getattr(
-        args, "micro_batch_size", training.micro_batch_size
-    )
-    training.learning_rate = getattr(args, "learning_rate", training.learning_rate)
-    training.weight_decay = getattr(args, "weight_decay", training.weight_decay)
-    training.warmup_steps = getattr(args, "warmup_steps", training.warmup_steps)
-    training.num_train_epochs = getattr(
-        args, "num_train_epochs", training.num_train_epochs
-    )
-    training.max_steps = getattr(args, "max_steps", training.max_steps)
-    training.logging_steps = getattr(args, "logging_steps", training.logging_steps)
-    training.eval_steps = getattr(args, "eval_steps", training.eval_steps)
-    training.save_steps = getattr(args, "save_steps", training.save_steps)
-    training.save_total_limit = getattr(
-        args, "save_total_limit", training.save_total_limit
-    )
-    training.random_seed = getattr(args, "random_seed", training.random_seed)
-    training.output_dir = Path(getattr(args, "output_dir", training.output_dir))
-    training.experiment_name = getattr(
-        args, "experiment_name", training.experiment_name
-    )
+    for field_name in [
+        "gradient_accumulation_steps",
+        "micro_batch_size",
+        "learning_rate",
+        "weight_decay",
+        "warmup_steps",
+        "num_train_epochs",
+        "max_steps",
+        "logging_steps",
+        "eval_steps",
+        "save_steps",
+        "save_total_limit",
+        "random_seed",
+    ]:
+        val = getattr(args, field_name, None)
+        if val is not None:
+            setattr(training, field_name, val)
+
+    if getattr(args, "output_dir", None) is not None:
+        training.output_dir = Path(args.output_dir)
+    if getattr(args, "experiment_name", None) is not None:
+        training.experiment_name = args.experiment_name
 
     # --- 数据集相关覆盖 ---
-    # 检查是否存在与数据集相关的参数，如果存在，则调用 _load_dataset_mix 更新配置
-    if hasattr(args, "dataset_config") or hasattr(args, "reasoning_source"):
+    if any(
+        hasattr(args, nm)
+        for nm in ["dataset_config", "reasoning_source", "instruction_source"]
+    ):
         training.dataset_mix = _load_dataset_mix(args, training.dataset_mix)
-    training.eval_split_ratio = getattr(
-        args, "eval_split_ratio", training.eval_split_ratio
-    )
-    training.dataset_num_proc = getattr(
-        args, "dataset_num_proc", training.dataset_num_proc
-    )
+    if getattr(args, "eval_split_ratio", None) is not None:
+        training.eval_split_ratio = args.eval_split_ratio
+    if getattr(args, "dataset_num_proc", None) is not None:
+        training.dataset_num_proc = args.dataset_num_proc
 
     # --- 模型保存相关覆盖 ---
-    training.save_merged_model = getattr(
-        args, "save_merged_model", training.save_merged_model
-    )
-    training.merge_dtype = getattr(args, "merge_dtype", training.merge_dtype)
+    if getattr(args, "save_merged_model", None) is not None:
+        training.save_merged_model = args.save_merged_model
+    if getattr(args, "merge_dtype", None) is not None:
+        training.merge_dtype = args.merge_dtype
 
     # --- GRPO 相关覆盖 ---
-    # 检查 with_grpo 标志，如果为 True，则启用 GRPO
-    if hasattr(args, "with_grpo"):
-        project.grpo.enable = args.with_grpo or project.grpo.enable
-    # 对于 GRPO 的参数，使用 `or` 链接默认值，确保即使命令行传入 0 或空字符串也能正确处理
-    project.grpo.steps = (
-        getattr(args, "grpo_steps", project.grpo.steps) or project.grpo.steps
-    )
-    project.grpo.learning_rate = (
-        getattr(args, "grpo_learning_rate", project.grpo.learning_rate)
-        or project.grpo.learning_rate
-    )
-    project.grpo.beta = (
-        getattr(args, "grpo_beta", project.grpo.beta) or project.grpo.beta
-    )
-    project.grpo.kl_coef = (
-        getattr(args, "grpo_kl", project.grpo.kl_coef) or project.grpo.kl_coef
-    )
-    project.grpo.mini_batch_size = (
-        getattr(args, "grpo_mini_batch", project.grpo.mini_batch_size)
-        or project.grpo.mini_batch_size
-    )
-    project.grpo.gradient_accumulation_steps = (
-        getattr(
-            args,
-            "grpo_gradient_accumulation",
-            project.grpo.gradient_accumulation_steps,
-        )
-        or project.grpo.gradient_accumulation_steps
-    )
-    grpo_save_steps = getattr(args, "grpo_save_steps", None)
-    if grpo_save_steps is not None:
-        project.grpo.save_steps = grpo_save_steps
-    grpo_reference_free = getattr(args, "grpo_reference_free", None)
-    if grpo_reference_free is not None:
-        project.grpo.reference_free = grpo_reference_free
-    max_prompt_len = getattr(args, "grpo_max_prompt_len", None)
-    if max_prompt_len is not None:
-        project.grpo.max_prompt_len = max_prompt_len
-    max_completion_len = getattr(args, "grpo_max_completion_len", None)
-    if max_completion_len is not None:
-        project.grpo.max_completion_len = max_completion_len
-    num_generations = getattr(args, "grpo_num_generations", None)
-    if num_generations is not None:
-        project.grpo.num_generations_per_prompt = num_generations
-    max_tokens_per_step = getattr(args, "grpo_max_tokens_per_step", None)
-    if max_tokens_per_step is not None:
-        project.grpo.max_tokens_per_step = (
-            max_tokens_per_step if max_tokens_per_step > 0 else None
-        )
+    if getattr(args, "with_grpo", None):
+        project.grpo.enable = True
+
+    grpo_map = {
+        "grpo_steps": "steps",
+        "grpo_learning_rate": "learning_rate",
+        "grpo_beta": "beta",
+        "grpo_epsilon": "epsilon",
+        "grpo_delta": "delta",
+        "grpo_epsilon_high": "epsilon_high",
+        "grpo_kl": "kl_coef",
+        "grpo_importance_level": "importance_sampling_level",
+        "grpo_mini_batch": "mini_batch_size",
+        "grpo_generation_batch_size": "generation_batch_size",
+        "grpo_gradient_accumulation": "gradient_accumulation_steps",
+        "grpo_num_generations": "num_generations_per_prompt",
+        "grpo_steps_per_generation": "steps_per_generation",
+        "grpo_num_iterations": "num_iterations",
+        "grpo_max_prompt_len": "max_prompt_len",
+        "grpo_max_completion_len": "max_completion_len",
+        "grpo_max_tokens_per_step": "max_tokens_per_step",
+        "grpo_temperature": "temperature",
+        "grpo_top_p": "top_p",
+        "grpo_top_k": "top_k",
+        "grpo_min_p": "min_p",
+        "grpo_repetition_penalty": "repetition_penalty",
+        "grpo_loss_type": "loss_type",
+        "grpo_mask_truncated_completions": "mask_truncated_completions",
+        "grpo_vllm_importance_sampling_correction": "vllm_importance_sampling_correction",
+        "grpo_vllm_importance_sampling_cap": "vllm_importance_sampling_cap",
+        "grpo_gpu_memory_utilization": "unsloth_gpu_memory_utilization",
+        "grpo_reference_free": "reference_free",
+        "grpo_mixed_precision": "mixed_precision",
+        "grpo_logging_steps": "logging_steps",
+        "grpo_save_steps": "save_steps",
+        "grpo_torch_compile": "torch_compile",
+        "grpo_optim": "optim",
+        "grpo_unsloth_num_chunks": "unsloth_num_chunks",
+    }
+    for arg_name, attr_name in grpo_map.items():
+        val = getattr(args, arg_name, None)
+        if val is not None:
+            # 特殊处理 max_tokens_per_step 允许 <=0 视为 None
+            if attr_name == "max_tokens_per_step" and isinstance(val, int) and val <= 0:
+                val = None
+            setattr(project.grpo, attr_name, val)
+
+    if getattr(args, "grpo_scale_rewards", None) is not None:
+        val = args.grpo_scale_rewards
+        if isinstance(val, str) and val.lower() in {"true", "false"}:
+            val = val.lower() == "true"
+        project.grpo.scale_rewards = val
+
+    if getattr(args, "grpo_reward_weights", None) is not None:
+        parsed = _maybe_parse_csv_floats(args.grpo_reward_weights)
+        if parsed is not None:
+            project.grpo.reward_weights = parsed
+
     grpo_dataset_arg = getattr(args, "grpo_dataset", None)
     if grpo_dataset_arg is not None:
         parsed = _parse_source_arg(grpo_dataset_arg)
-        if parsed is None:
-            project.grpo.dataset = None
-        else:
+        if parsed:
             dataset_kwargs = dict(parsed)
             grpo_split = getattr(args, "grpo_dataset_split", None)
-            if grpo_split:
+            if grpo_split is not None:
                 dataset_kwargs["split"] = grpo_split
             grpo_max_samples = getattr(args, "grpo_dataset_max_samples", None)
             if grpo_max_samples is not None:
                 dataset_kwargs["max_samples"] = grpo_max_samples
-            project.grpo.dataset = DatasetSource(reasoning=True, **dataset_kwargs)
+            project.grpo.dataset = DatasetSource(**dataset_kwargs)
 
 
-# --- 参数注册函数 ---
-# 将相关参数的定义封装在独立的函数中，使 `build_parser` 函数更清晰、更模块化。
-# 这种做法提高了代码的可读性和可维护性。
+# ---------------- 参数注册 ----------------
 
 def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     """注册与数据源相关的命令行参数."""
+    parser.add_argument("--dataset-config", type=str, default=None, help="定义数据集混合的JSON文件路径")
+    parser.add_argument("--reasoning-source", type=str, default=None, help="主要的推理数据集 (HF 仓库或本地文件)")
+    parser.add_argument("--instruction-source", type=str, default=None, help="辅助的指令数据集")
     parser.add_argument(
-        "--dataset-config", type=str, help="定义数据集混合的JSON文件路径"
+        "--reasoning-weight",
+        type=float,
+        default=None,
+        help=f"推理数据集的权重 (默认 {REASONING_DATASET_DEFAULT_WEIGHT})",
     )
     parser.add_argument(
-        "--reasoning-source", type=str, help="主要的推理数据集 (HF 仓库或本地文件)"
-    )
-    parser.add_argument("--instruction-source", type=str, help="辅助的指令数据集")
-    parser.add_argument(
-        "--reasoning-weight", type=float, default=0.75, help="推理数据集的权重"
-    )
-    parser.add_argument(
-        "--instruction-weight", type=float, default=0.25, help="指令数据集的权重"
+        "--instruction-weight",
+        type=float,
+        default=None,
+        help=f"指令数据集的权重 (默认 {INSTRUCTION_DATASET_DEFAULT_WEIGHT})",
     )
 
 
 def _add_model_args(parser: argparse.ArgumentParser) -> None:
     """注册模型加载相关的参数."""
-    parser.add_argument(
-        "--base-model-id", type=str, default=None, help="Hugging Face 上的基础模型 ID"
-    )
+    parser.add_argument("--base-model-id", type=str, default=None, help="Hugging Face 上的基础模型 ID")
     parser.add_argument(
         "--base-model-path",
         type=str,
-        default="models/Qwen3-4B-Thinking-2507",
-        help="本地基础模型的路径",
+        default=None,
+        help="本地基础模型的路径 (未提供则使用 config 默认)",
     )
-    parser.add_argument("--max-seq-length", type=int, default=4096, help="最大序列长度")
-    # `action="store_true"`: 这是一个布尔标志。当命令行出现 `--load-in-4bit` 标志时，
-    # argparse 会将 `load_in_4bit` 属性设为 True。如果标志不存在，则为 False。
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=None,
+        help=f"最大序列长度 (默认 {MAX_SEQ_LENGTH_DEFAULT})",
+    )
     parser.add_argument(
         "--load-in-4bit",
         action="store_true",
-        default=True,
-        help="以4位模式加载模型 (默认启用)",
+        default=None,
+        help="启用4bit量化 (默认 config 中设置)",
     )
-    # `dest` 和 `action="store_false"`: 这是一种创建“否定”标志的技巧。
-    # 当命令行出现 `--no-4bit` 标志时，argparse 会将 `load_in_4bit` (`dest`指定的目标) 设为 False。
-    # 这比让用户输入 `--load-in-4bit False` 更直观。
     parser.add_argument(
-        "--no-4bit", dest="load_in_4bit", action="store_false", help="禁用4位加载模式"
+        "--no-4bit",
+        dest="load_in_4bit",
+        action="store_false",
+        help="禁用4bit量化",
     )
-    parser.add_argument("--load-in-8bit", action="store_true", help="以8位模式加载模型")
     parser.add_argument(
-        "--full-finetuning", action="store_true", help="进行全参数微调 (而不是 LoRA)"
+        "--load-in-8bit", action="store_true", default=None, help="启用8bit量化"
+    )
+    parser.add_argument(
+        "--full-finetuning", action="store_true", default=None, help="进行全参数微调 (默认使用 LoRA)"
     )
 
 
 def _add_lora_args(parser: argparse.ArgumentParser) -> None:
     """注册 LoRA (低秩适配) 相关的参数."""
-    parser.add_argument("--lora-rank", type=int, default=64, help="LoRA 秩 (rank)")
-    parser.add_argument(
-        "--lora-alpha", type=int, default=64, help="LoRA alpha 缩放因子"
-    )
-    parser.add_argument(
-        "--lora-dropout", type=float, default=0.05, help="LoRA dropout 概率"
-    )
+    parser.add_argument("--lora-rank", type=int, default=None, help="LoRA 秩 (默认 config)")
+    parser.add_argument("--lora-alpha", type=int, default=None, help="LoRA alpha (默认 config)")
+    parser.add_argument("--lora-dropout", type=float, default=None, help="LoRA dropout (默认 config)")
 
 
 def _add_train_args(parser: argparse.ArgumentParser) -> None:
     """注册训练阶段的超参数选项."""
+    parser.add_argument("--micro-batch-size", type=int, default=None, help="每个设备上的微批次大小")
+    parser.add_argument("--gradient-accumulation-steps", type=int, default=None, help="梯度累积步数")
+    parser.add_argument("--learning-rate", type=float, default=None, help="学习率 (默认 config)")
+    parser.add_argument("--weight-decay", type=float, default=None, help="权重衰减")
+    parser.add_argument("--warmup-steps", type=int, default=None, help="学习率预热步数")
+    parser.add_argument("--num-train-epochs", type=float, default=None, help="总训练轮数")
+    parser.add_argument("--max-steps", type=int, default=None, help="最大训练步数 (若非-1，则覆盖 epochs)")
+    parser.add_argument("--logging-steps", type=int, default=None, help="日志记录步数")
+    parser.add_argument("--eval-steps", type=int, default=None, help="评估步数")
+    parser.add_argument("--save-steps", type=int, default=None, help="模型保存步数")
+    parser.add_argument("--save-total-limit", type=int, default=None, help="最多保存的检查点数量")
+    parser.add_argument("--random-seed", type=int, default=None, help="随机种子")
     parser.add_argument(
-        "--micro-batch-size", type=int, default=2, help="每个设备上的微批次大小"
+        "--output-dir", type=str, default=None, help="训练输出和检查点的根目录"
     )
     parser.add_argument(
-        "--gradient-accumulation-steps", type=int, default=1, help="梯度累积步数"
+        "--experiment-name", type=str, default=None, help="实验名称，用于区分不同的运行"
     )
-    parser.add_argument("--learning-rate", type=float, default=2e-5, help="学习率")
-    parser.add_argument("--weight-decay", type=float, default=0.01, help="权重衰减")
-    parser.add_argument("--warmup-steps", type=int, default=100, help="学习率预热步数")
-    parser.add_argument(
-        "--num-train-epochs", type=float, default=1.0, help="总训练轮数"
-    )
-    parser.add_argument(
-        "--max-steps", type=int, default=-1, help="最大训练步数 (若非-1，则覆盖 epochs)"
-    )
-    parser.add_argument("--logging-steps", type=int, default=10, help="日志记录步数")
-    parser.add_argument("--eval-steps", type=int, default=50, help="评估步数")
-    parser.add_argument("--save-steps", type=int, default=200, help="模型保存步数")
-    parser.add_argument(
-        "--save-total-limit", type=int, default=3, help="最多保存的检查点数量"
-    )
-    parser.add_argument("--random-seed", type=int, default=3407, help="随机种子")
-    parser.add_argument(
-        "--output-dir",
-        type=str,
-        default="outputs/local_sft_big",
-        help="训练输出和检查点的根目录",
-    )
-    parser.add_argument(
-        "--experiment-name", type=str, default="qwen_math_tutor", help="实验名称，用于区分不同的运行"
-    )
-    parser.add_argument(
-        "--eval-split-ratio", type=float, default=0.02, help="从训练集中划分出的验证集比例"
-    )
-    parser.add_argument(
-        "--dataset-num-proc", type=int, default=1, help="数据预处理时使用的进程数"
-    )
+    parser.add_argument("--eval-split-ratio", type=float, default=None, help="验证集比例")
+    parser.add_argument("--dataset-num-proc", type=int, default=None, help="数据预处理进程数")
     parser.add_argument(
         "--save-merged-model",
         action="store_true",
-        default=True,
-        help="训练后自动将 LoRA 适配器与基础模型合并并保存 (默认启用)",
+        default=None,
+        help="训练后合并并保存模型 (默认参见 config)",
     )
     parser.add_argument(
-        "--no-save-merged-model",
-        dest="save_merged_model",
-        action="store_false",
-        help="不保存合并后的模型",
+        "--no-save-merged-model", dest="save_merged_model", action="store_false", help="不合并保存模型"
     )
     parser.add_argument(
-        "--merge-dtype",
-        type=str,
-        default="fp16",
-        help="合并模型时使用的数据类型 (fp16, bf16, float)",
+        "--merge-dtype", type=str, default=None, help="合并模型使用的数据类型 (fp16/bf16/float)"
     )
 
 
 def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
     """注册 GRPO 阶段的特有参数。"""
     parser.add_argument("--with-grpo", action="store_true", help="在 SFT 后启用 GRPO 训练")
-    parser.add_argument("--grpo-steps", type=int, default=500, help="GRPO 训练的总步数")
-    parser.add_argument("--grpo-learning-rate", type=float, default=8e-6, help="GRPO 阶段的学习率")
-    parser.add_argument("--grpo-beta", type=float, default=0.2, help="GRPO 损失中的 beta 参数 (KL 散度权重)")
-    parser.add_argument("--grpo-kl", type=float, default=0.06, help="GRPO 的 KL 散度系数")
-    parser.add_argument("--grpo-mini-batch", type=int, default=16, help="GRPO 的 mini-batch 大小")
-    parser.add_argument("--grpo-gradient-accumulation", type=int, default=1, help="GRPO 的梯度累积步数")
+    parser.add_argument("--grpo-steps", type=int, default=None, help="GRPO 训练的总步数")
+    parser.add_argument("--grpo-learning-rate", type=float, default=None, help="GRPO 阶段的学习率")
+    parser.add_argument("--grpo-beta", type=float, default=None, help="KL 系数；0.0 则参考模型不加载")
+    parser.add_argument("--grpo-kl", type=float, default=None, help="KL 散度系数")
+    parser.add_argument("--grpo-epsilon", type=float, default=None, help="令牌级对数概率比率裁剪值 ε")
+    parser.add_argument("--grpo-delta", type=float, default=None, help="双面 GRPO 上裁剪边界 δ")
+    parser.add_argument("--grpo-epsilon-high", type=float, default=None, help="上界 ε_high；未设则为 ε")
+    parser.add_argument("--grpo-mini-batch", type=int, default=None, help="per-device train batch size")
+    parser.add_argument("--grpo-generation-batch-size", type=int, default=None, help="生成批次大小")
+    parser.add_argument("--grpo-gradient-accumulation", type=int, default=None, help="梯度累积步数")
+    parser.add_argument("--grpo-num-generations", type=int, default=None, help="每个 prompt 生成的数量 (需>2)")
+    parser.add_argument("--grpo-steps-per-generation", type=int, default=None, help="每次生成的步数")
+    parser.add_argument("--grpo-num-iterations", type=int, default=None, help="每批次的 GRPO 周期数 (μ)")
+    parser.add_argument("--grpo-max-prompt-len", type=int, default=None, help="最大 prompt token 数")
+    parser.add_argument("--grpo-max-completion-len", type=int, default=None, help="最大 completion token 数")
+    parser.add_argument("--grpo-max-tokens-per-step", type=int, default=None, help="每步 token 预算软上限")
+    parser.add_argument("--grpo-temperature", type=float, default=None, help="采样温度")
+    parser.add_argument("--grpo-top-p", type=float, default=None, help="Top-p 阈值")
+    parser.add_argument("--grpo-top-k", type=int, default=None, help="Top-k 上限")
+    parser.add_argument("--grpo-min-p", type=float, default=None, help="Min-p 阈值")
+    parser.add_argument("--grpo-repetition-penalty", type=float, default=None, help="重复惩罚系数")
     parser.add_argument(
-        "--grpo-reference-free",
-        dest="grpo_reference_free",
-        action="store_true",
-        help="使用无参考模型的 GRPO 变体",
-    )
-    parser.add_argument(
-        "--no-grpo-reference-free",
-        dest="grpo_reference_free",
-        action="store_false",
-        help="使用带参考模型的标准 GRPO",
-    )
-    # `set_defaults` 用于为可能不出现的参数设置一个默认值，以避免 AttributeError。
-    parser.set_defaults(grpo_reference_free=None)
-    parser.add_argument(
-        "--grpo-dataset",
+        "--grpo-scale-rewards",
         type=str,
         default=None,
-        help="用于 GRPO 的特定数据集 (HF 仓库或本地文件)",
+        help='奖励缩放方式："group" | "batch" | "none" | true | false',
     )
     parser.add_argument(
-        "--grpo-dataset-split", type=str, default=None, help="GRPO 数据集使用的数据切分 (如 'train')"
-    )
-    parser.add_argument(
-        "--grpo-dataset-max-samples",
-        type=int,
+        "--grpo-loss-type",
+        type=str,
+        choices=["dapo", "grpo", "dr_grpo", "bnpo"],
         default=None,
-        help="可选，限制 GRPO 数据集的最大样本数",
+        help="损失类型",
     )
     parser.add_argument(
-        "--grpo-max-prompt-len",
-        type=int,
-        default=768,
-        help="覆盖 GRPO 生成阶段的最大 prompt token 数",
+        "--grpo-mask-truncated-completions",
+        action="store_true",
+        help="将被截断的完成从损失中排除",
     )
     parser.add_argument(
-        "--grpo-max-completion-len",
-        type=int,
-        default=2048,
-        help="覆盖 GRPO 生成阶段的最大 completion token 数",
+        "--no-grpo-mask-truncated-completions",
+        dest="grpo_mask_truncated_completions",
+        action="store_false",
+        help="不排除被截断的完成 (默认)",
     )
+    parser.set_defaults(grpo_mask_truncated_completions=None)
     parser.add_argument(
-        "--grpo-num-generations",
-        type=int,
-        default=2,
-        help="在 GRPO 期间，每个 prompt 生成的响应数量",
-    )
-    parser.add_argument(
-        "--grpo-save-steps",
-        type=int,
+        "--grpo-importance-level",
+        type=str,
+        choices=["token", "sequence"],
         default=None,
-        help="每 N 个训练步数保存一次 GRPO 检查点",
+        help="重要性采样级别",
     )
     parser.add_argument(
-        "--grpo-max-tokens-per-step",
-        type=int,
+        "--grpo-reward-weights",
+        type=str,
         default=None,
-        help=(
-            "每个优化步骤的估计 token 数的软上限；设置后，"
-            "训练器将裁剪 prompt/completion 长度以遵守此预算。"
-        ),
+        help="逗号分隔的奖励权重，例如: 1.0,0.5",
+    )
+    parser.add_argument(
+        "--grpo-vllm-importance-sampling-correction",
+        dest="grpo_vllm_importance_sampling_correction",
+        action="store_true",
+        help="启用截断重要性采样校正",
+    )
+    parser.add_argument(
+        "--no-grpo-vllm-importance-sampling-correction",
+        dest="grpo_vllm_importance_sampling_correction",
+        action="store_false",
+        help="禁用截断重要性采样校正",
+    )
+    parser.set_defaults(grpo_vllm_importance_sampling_correction=None)
+    parser.add_argument(
+        "--grpo-vllm-importance-sampling-cap", type=float, default=None, help="TIS 截断参数 C"
+    )
+    parser.add_argument(
+        "--grpo-gpu-memory-utilization", type=float, default=None, help="Unsloth GPU memory 利用率"
+    )
+    parser.add_argument(
+        "--grpo-reference-free", dest="grpo_reference_free", action="store_true", help="使用无参考模型 GRPO"
+    )
+    parser.add_argument(
+        "--no-grpo-reference-free", dest="grpo_reference_free", action="store_false", help="使用参考模型"
+    )
+    parser.set_defaults(grpo_reference_free=None)
+    parser.add_argument("--grpo-mixed-precision", type=str, default=None, help="混合精度 (fp16/bf16)")
+    parser.add_argument("--grpo-logging-steps", type=int, default=None, help="GRPO 日志步数")
+    parser.add_argument("--grpo-save-steps", type=int, default=None, help="GRPO 保存步数")
+    parser.add_argument(
+        "--grpo-torch-compile", action="store_true", help="启用 torch.compile"
+    )
+    parser.add_argument(
+        "--no-grpo-torch-compile", dest="grpo_torch_compile", action="store_false", help="禁用 torch.compile"
+    )
+    parser.set_defaults(grpo_torch_compile=None)
+    parser.add_argument("--grpo-optim", type=str, default=None, help="优化器 (如 adamw_8bit)")
+    parser.add_argument("--grpo-unsloth-num-chunks", type=int, default=None, help="Unsloth num chunks")
+    parser.add_argument(
+        "--grpo-dataset", type=str, default=None, help="用于 GRPO 的数据集 (HF 仓库或本地文件)"
+    )
+    parser.add_argument(
+        "--grpo-dataset-split", type=str, default=None, help="GRPO 数据集使用的数据切分"
+    )
+    parser.add_argument(
+        "--grpo-dataset-max-samples", type=int, default=None, help="限制 GRPO 数据集的最大样本数"
     )
 
 
@@ -606,8 +638,6 @@ def build_parser() -> argparse.ArgumentParser:
     predict_parser.add_argument(
         "--max-new-tokens", type=int, default=512, help="生成的最大 token 数"
     )
-    # `action="append"`: 允许多次使用 `--question` 参数，每次的值都会被追加到一个列表中。
-    # e.g., `... predict --question "1+1=?" --question "2+2=?"`
     predict_parser.add_argument(
         "--question", action="append", required=True, help="要提问的问题 (可多次指定)"
     )

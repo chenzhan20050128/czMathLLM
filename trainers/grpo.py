@@ -375,6 +375,9 @@ def run_grpo_training(
 
     # 加载参考模型（如果需要）
     ref_model = None
+    # 若 beta==0.0 则强制 reference_free
+    if grpo_cfg.beta == 0.0:
+        grpo_cfg.reference_free = True
     if not grpo_cfg.reference_free:
         ref_base, _ = load_base_model(training_cfg)
         ref_model = PeftModel.from_pretrained(
@@ -438,7 +441,7 @@ def run_grpo_training(
     # 5. 动态构建 HFGRPOConfig 参数
     grpo_output_dir = Path(training_cfg.checkpoints_dir) / "grpo"
     grpo_output_dir.mkdir(parents=True, exist_ok=True)
-    config_kwargs = {}
+    config_kwargs: dict[str, Any] = {}
     available_fields = {field.name for field in fields(HFGRPOConfig)}
 
     # 这是一个非常健壮的设计：只填充当前 TRL 版本支持的参数
@@ -470,12 +473,55 @@ def run_grpo_training(
         config_kwargs["save_steps"] = grpo_cfg.save_steps
     if "output_dir" in available_fields:
         config_kwargs["output_dir"] = str(grpo_output_dir)
-    if "generation_batch_size" in available_fields:
-        config_kwargs["generation_batch_size"] = grpo_cfg.mini_batch_size
+    if "generation_batch_size" in available_fields and grpo_cfg.generation_batch_size:
+        config_kwargs["generation_batch_size"] = grpo_cfg.generation_batch_size
     if "num_generations" in available_fields:
         config_kwargs["num_generations"] = grpo_cfg.num_generations_per_prompt
     if "unsloth_num_chunks" in available_fields:
         config_kwargs["unsloth_num_chunks"] = grpo_cfg.unsloth_num_chunks
+    # 新增：Unsloth 相关字段传递
+    if "unsloth_gpu_memory_utilization" in available_fields and getattr(grpo_cfg, "unsloth_gpu_memory_utilization", None) is not None:
+        config_kwargs["unsloth_gpu_memory_utilization"] = grpo_cfg.unsloth_gpu_memory_utilization
+    if "num_iterations" in available_fields and getattr(grpo_cfg, "num_iterations", None) is not None:
+        config_kwargs["num_iterations"] = grpo_cfg.num_iterations
+
+    # 额外的 Unsloth/TRL 可选字段（若存在）
+    if "epsilon" in available_fields:
+        config_kwargs["epsilon"] = grpo_cfg.epsilon
+    if "delta" in available_fields and grpo_cfg.delta is not None:
+        config_kwargs["delta"] = grpo_cfg.delta
+    if "epsilon_high" in available_fields and grpo_cfg.epsilon_high is not None:
+        config_kwargs["epsilon_high"] = grpo_cfg.epsilon_high
+    if "importance_sampling_level" in available_fields:
+        config_kwargs["importance_sampling_level"] = grpo_cfg.importance_sampling_level
+    if "scale_rewards" in available_fields and grpo_cfg.scale_rewards is not None:
+        config_kwargs["scale_rewards"] = grpo_cfg.scale_rewards
+    if "loss_type" in available_fields:
+        config_kwargs["loss_type"] = grpo_cfg.loss_type
+    if "mask_truncated_completions" in available_fields:
+        config_kwargs["mask_truncated_completions"] = grpo_cfg.mask_truncated_completions
+    if "vllm_importance_sampling_correction" in available_fields:
+        config_kwargs["vllm_importance_sampling_correction"] = grpo_cfg.vllm_importance_sampling_correction
+    if "vllm_importance_sampling_cap" in available_fields:
+        config_kwargs["vllm_importance_sampling_cap"] = grpo_cfg.vllm_importance_sampling_cap
+    if "temperature" in available_fields:
+        config_kwargs["temperature"] = grpo_cfg.temperature
+    if "top_p" in available_fields and grpo_cfg.top_p is not None:
+        config_kwargs["top_p"] = grpo_cfg.top_p
+    if "top_k" in available_fields and grpo_cfg.top_k is not None:
+        config_kwargs["top_k"] = grpo_cfg.top_k
+    if "min_p" in available_fields and grpo_cfg.min_p is not None:
+        config_kwargs["min_p"] = grpo_cfg.min_p
+    if "repetition_penalty" in available_fields and grpo_cfg.repetition_penalty is not None:
+        config_kwargs["repetition_penalty"] = grpo_cfg.repetition_penalty
+    if "steps_per_generation" in available_fields and grpo_cfg.steps_per_generation is not None:
+        config_kwargs["steps_per_generation"] = grpo_cfg.steps_per_generation
+    if "logging_steps" in available_fields:
+        config_kwargs["logging_steps"] = grpo_cfg.logging_steps
+    if "optim" in available_fields and grpo_cfg.optim is not None:
+        config_kwargs["optim"] = grpo_cfg.optim
+    if "torch_compile" in available_fields and grpo_cfg.torch_compile is not None:
+        config_kwargs["torch_compile"] = grpo_cfg.torch_compile
 
     hf_config = HFGRPOConfig(**config_kwargs)
     # 确保 max_steps 被正确设置
@@ -485,7 +531,7 @@ def run_grpo_training(
         setattr(hf_config, "unsloth_num_chunks", grpo_cfg.unsloth_num_chunks)
 
     # 动态构建 GRPOTrainer 的初始化参数
-    trainer_kwargs = {}
+    trainer_kwargs: dict[str, Any] = {}
     trainer_sig = inspect.signature(GRPOTrainer.__init__)
     if "model" in trainer_sig.parameters:
         trainer_kwargs["model"] = peft_model
@@ -515,7 +561,7 @@ def run_grpo_training(
     trainer = GRPOTrainer(**trainer_kwargs)
     trainer.add_callback(_RewardLoggingCallback(reward_buffer))
 
-    train_kwargs = {}
+    train_kwargs: dict[str, Any] = {}
     train_sig = inspect.signature(trainer.train)
     if "resume_from_checkpoint" in train_sig.parameters:
         train_kwargs["resume_from_checkpoint"] = resume_from_checkpoint
