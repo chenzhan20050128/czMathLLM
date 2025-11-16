@@ -42,11 +42,14 @@ from ..utils import set_global_seed, dump_dataclass
 # --- 常量定义 ---
 TOKEN_WARNING_THRESHOLD = 160_000  # 当单步 token 开销超过此阈值时发出警告
 BASE_THROUGHPUT_TOK_PER_S = 320.0  # 用于估算训练时间的基准吞吐量 (tokens/sec)
-MAX_LOGGED_COMPLETION_CHARS = 4096 # 日志中打印的最长 completion 字符数，防止日志过长
+MAX_LOGGED_COMPLETION_CHARS = 4096  # 日志中打印的最长 completion 字符数，防止日志过长
+# 预留给系统/模板/特殊 token 的冗余，避免 prompt+completion 正好贴边导致运行期再截断
+RESERVED_SPECIAL_TOKENS = 128
 
 
 class _RewardBuffer:
     """一个用于在训练过程中缓冲和聚合奖励信息的辅助类."""
+
     def __init__(self, max_chars: int = MAX_LOGGED_COMPLETION_CHARS) -> None:
         self._records: list[tuple[str, str, float]] = []
         self._max_chars = max_chars
@@ -115,6 +118,7 @@ class _RewardBuffer:
 
 class _RewardLoggingCallback(TrainerCallback):
     """一个自定义的 `transformers.TrainerCallback`，用于在训练的特定阶段打印奖励信息."""
+
     def __init__(self, buffer: _RewardBuffer) -> None:
         self._buffer = buffer
 
@@ -181,12 +185,15 @@ def _apply_token_budget_once(
             grpo_cfg.max_prompt_len = int(prompt_limit)
             updated = True
 
-    # 确保 prompt + completion 不超过模型的最大序列长度
+    # 确保 prompt + completion 不超过模型的最大序列长度（留出一定冗余给模板/特殊token）
     if (
         grpo_cfg.max_prompt_len + grpo_cfg.max_completion_len
-        > training_cfg.max_seq_length
+        > training_cfg.max_seq_length - RESERVED_SPECIAL_TOKENS
     ):
-        cap = max(training_cfg.max_seq_length - grpo_cfg.max_prompt_len, 64)
+        effective_max_seq = max(
+            256, training_cfg.max_seq_length - RESERVED_SPECIAL_TOKENS
+        )
+        cap = max(effective_max_seq - grpo_cfg.max_prompt_len, 64)
         if cap < grpo_cfg.max_completion_len:
             print(
                 "[GRPO] 自动限制 max_completion_len 以符合模型最大序列长度: "
@@ -234,20 +241,33 @@ def _log_workload(grpo_cfg: GRPOConfig, workload: dict[str, int]) -> None:
     mini_batch = grpo_cfg.mini_batch_size
     grad_accum = grpo_cfg.gradient_accumulation_steps
     print(
-        f"[GRPO] 有效prompt批次 = {batch_info} (mini_batch={mini_batch}, grad_accum={grad_accum})"
+        (
+            f"[GRPO] 有效prompt批次 = {batch_info} "
+            f"(mini_batch={mini_batch}, grad_accum={grad_accum})"
+        )
     )
     print(
-        f"        每step生成 {_format_int(completions_per_step)} 条completion (每prompt {grpo_cfg.num_generations_per_prompt} 条)。"
+        (
+            f"        每step生成 {_format_int(completions_per_step)} 条completion "
+            f"(每prompt {grpo_cfg.num_generations_per_prompt} 条)。"
+        )
     )
     print(
-        f"[GRPO] 估算单step token 开销 ≈ {_format_int(tokens_per_step)} (prompt_len={prompt_len}, completion_len={completion_len})。"
+        (
+            f"[GRPO] 估算单step token 开销 ≈ {_format_int(tokens_per_step)} "
+            f"(prompt_len={prompt_len}, completion_len={completion_len})。"
+        )
     )
     if not grpo_cfg.reference_free:
         print("[GRPO] 当前启用了参考模型，logprob 计算将额外增加一次完整的前向传播。")
 
     if grpo_cfg.max_tokens_per_step:
         print(
-            f"[GRPO] token预算设定为 {_format_int(grpo_cfg.max_tokens_per_step)}，估算开销 {_format_int(tokens_per_step)}。"
+            (
+                f"[GRPO] token预算设定为 "
+                f"{_format_int(grpo_cfg.max_tokens_per_step)}，"
+                f"估算开销 {_format_int(tokens_per_step)}。"
+            )
         )
 
     if (
@@ -256,10 +276,17 @@ def _log_workload(grpo_cfg: GRPOConfig, workload: dict[str, int]) -> None:
     ):
         approx_minutes = tokens_per_step / BASE_THROUGHPUT_TOK_PER_S / 60.0
         print(
-            f"[GRPO][提示] 该配置预计每step耗时约 {approx_minutes:.1f} 分钟（按 {int(BASE_THROUGHPUT_TOK_PER_S)} tok/s 估算）。"
+            (
+                f"[GRPO][提示] 该配置预计每step耗时约 {approx_minutes:.1f} 分钟"
+                f"（按 {int(BASE_THROUGHPUT_TOK_PER_S)} tok/s 估算）。"
+            )
         )
         print(
-            "        若需更快迭代，可减小 --grpo-num-generations、--grpo-max-completion-len、--grpo-mini-batch 或 --grpo-gradient-accumulation。"
+            (
+                "        若需更快迭代，可减小 --grpo-num-generations、"
+                "--grpo-max-completion-len、--grpo-mini-batch 或 "
+                "--grpo-gradient-accumulation。"
+            )
         )
 
 
@@ -268,7 +295,7 @@ def _reward_function(
     *,  # 强制后续参数为关键字参数
     references: list[str],
     metadatas: list[dict],
-    **_: Any, # 使用 `**_` 忽略其他所有未使用的关键字参数，增加函数的健壮性
+    **_: Any,  # 使用 `**_` 忽略其他所有未使用的关键字参数，增加函数的健壮性
 ) -> list[float]:
     """一个简单的包装函数，将项目内部的 `batch_reward` 函数连接到 TRL 训练器。
 
@@ -296,7 +323,8 @@ def run_grpo_training(
           `ref_model`，但其权重是冻结的，仅用于计算 KL 散度。
     3.  **数据准备**:
         - 加载用于 GRPO 的源数据集。如果未指定，则复用 SFT 的训练集。
-        - 使用 `build_grpo_dataset` 将其转换为包含 `prompt`, `reference`, `metadata` 的格式。
+                - 使用 `build_grpo_dataset` 将其转换为包含 `prompt`, `reference`,
+                    `metadata` 的格式。
         - 创建一个 `prompt_lookup` 字典，用于在奖励计算时根据 `prompt` 快速查找其对应的
           `reference` 和 `metadata`。
     4.  **奖励函数准备**: 定义一个闭包 `reward_fn`。这个函数在被 TRL 调用时，
@@ -420,17 +448,47 @@ def run_grpo_training(
 
         if samples is None:
             samples = completions
+        # 优先使用 original_prompts（通常与 samples 等长，已重复展开）
         if prompts is None and _kwargs.get("original_prompts"):
             prompts = _kwargs["original_prompts"]
 
         if samples is None or prompts is None:
             raise ValueError("reward_fn missing samples or prompts")
 
+        # 确保 prompts 与 samples 数量对齐：
+        # - 若长度相同，直接对齐；
+        # - 若 samples 是 prompts 的整数倍（每个 prompt 生成多个 completions），按倍数展开 prompts；
+        # - 否则，回退为按最短长度对齐并给出提示（极少出现）。
+        try:
+            num_samples = len(samples)  # type: ignore[arg-type]
+            num_prompts = len(prompts)  # type: ignore[arg-type]
+        except Exception:
+            num_samples = num_prompts = 0
+
+        if num_samples and num_prompts and num_samples != num_prompts:
+            if num_samples % max(num_prompts, 1) == 0:
+                repeat = num_samples // max(num_prompts, 1)
+                prompts = [
+                    p for p in prompts for _ in range(repeat)
+                ]  # type: ignore[list-item]
+            else:
+                print(
+                    f"[GRPO][warn] prompts 与 samples 数量不一致，"
+                    f"samples={num_samples}, prompts={num_prompts}。"
+                    "将按最短长度对齐，可能影响奖励质量。"
+                )
+
+        # 构建与 samples 等长的 refs / metas
         refs, metas = [], []
-        for prompt in prompts:
+        for prompt in list(prompts)[: len(samples)]:  # type: ignore[index]
             reference, metadata = prompt_lookup.get(prompt, ("", {}))
+            meta = dict(metadata or {})
+            meta.setdefault("question", prompt)
+            meta.setdefault("prompt", prompt)
+            meta.setdefault("original_prompt", prompt)
             refs.append(reference)
-            metas.append(metadata)
+            metas.append(meta)
+
         rewards = _reward_function(samples, references=refs, metadatas=metas)
         reward_buffer.record(prompts, samples, rewards)
         return rewards
@@ -471,7 +529,19 @@ def run_grpo_training(
     if "output_dir" in available_fields:
         config_kwargs["output_dir"] = str(grpo_output_dir)
     if "generation_batch_size" in available_fields:
-        config_kwargs["generation_batch_size"] = grpo_cfg.mini_batch_size
+        gen_batch = grpo_cfg.generation_batch_size or grpo_cfg.mini_batch_size
+        num_gen = max(1, grpo_cfg.num_generations_per_prompt)
+        if gen_batch % num_gen != 0:
+            adjusted = ((gen_batch + num_gen - 1) // num_gen) * num_gen
+            print(
+                (
+                    "[GRPO] 自动调整 generation_batch_size: "
+                    f"{gen_batch} -> {adjusted} "
+                    f"(num_generations={num_gen})"
+                )
+            )
+            gen_batch = adjusted
+        config_kwargs["generation_batch_size"] = gen_batch
     if "num_generations" in available_fields:
         config_kwargs["num_generations"] = grpo_cfg.num_generations_per_prompt
     if "unsloth_num_chunks" in available_fields:
@@ -483,6 +553,22 @@ def run_grpo_training(
         setattr(hf_config, "max_steps", grpo_cfg.steps)
     if not hasattr(hf_config, "unsloth_num_chunks"):
         setattr(hf_config, "unsloth_num_chunks", grpo_cfg.unsloth_num_chunks)
+
+    # 一些环境（如从 checkpoint 恢复时）可能会让外部库根据 trainer_state.json 打印旧的 batch 参数。
+    # 这里显式再次覆盖，确保当前 CLI 传入的配置具有最高优先级。
+    try:
+        hf_config.per_device_train_batch_size = grpo_cfg.mini_batch_size
+        hf_config.gradient_accumulation_steps = grpo_cfg.gradient_accumulation_steps
+    except Exception:
+        pass
+
+    # 调试输出，帮助确认最终生效到 HF 配置中的关键训练参数
+    hf_bs = getattr(hf_config, "per_device_train_batch_size", "n/a")
+    hf_gas = getattr(hf_config, "gradient_accumulation_steps", "n/a")
+    print(
+        f"[GRPO] HF args — per_device_train_batch_size = {hf_bs}, "
+        f"gradient_accumulation_steps = {hf_gas}"
+    )
 
     # 动态构建 GRPOTrainer 的初始化参数
     trainer_kwargs = {}
@@ -514,6 +600,29 @@ def run_grpo_training(
     # 6. 初始化并执行训练
     trainer = GRPOTrainer(**trainer_kwargs)
     trainer.add_callback(_RewardLoggingCallback(reward_buffer))
+
+    # 再次在 trainer 上强制覆盖关键 batch 配置（尤其是在 resume_from_checkpoint 时，
+    # 某些库可能会参考 checkpoint 中保存的旧参数进行展示/打印）。
+    try:
+        if hasattr(trainer, "args"):
+            setattr(
+                trainer.args,
+                "per_device_train_batch_size",
+                grpo_cfg.mini_batch_size,
+            )
+            setattr(
+                trainer.args,
+                "gradient_accumulation_steps",
+                grpo_cfg.gradient_accumulation_steps,
+            )
+            t_bs = getattr(trainer.args, "per_device_train_batch_size", "n/a")
+            t_gas = getattr(trainer.args, "gradient_accumulation_steps", "n/a")
+            print(
+                f"[GRPO] Trainer args — per_device_train_batch_size = {t_bs}, "
+                f"gradient_accumulation_steps = {t_gas}"
+            )
+    except Exception:
+        pass
 
     train_kwargs = {}
     train_sig = inspect.signature(trainer.train)

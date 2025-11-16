@@ -13,9 +13,28 @@
 # from __future__ import annotations: 同样是为了支持延迟解析类型注解。
 from __future__ import annotations
 
+import logging
 import math
+import os
 import re
-from typing import Iterable
+from typing import Iterable, Sequence
+
+try:
+    import requests
+except ImportError:  # pragma: no cover - 作为可选依赖处理
+    requests = None  # type: ignore[assignment]
+
+logger = logging.getLogger(__name__)
+
+PRM_BASE_URL = os.environ.get("PRM_API_BASE_URL", "http://127.0.0.2:8025")
+PRM_SCORE_ENDPOINT = "/score"
+PRM_TIMEOUT_SECONDS = float(os.environ.get("PRM_API_TIMEOUT", "30"))
+
+MAX_REASONING_LENGTH = int(os.environ.get("PRM_MAX_REASONING_LENGTH", "4096"))
+
+RESULT_WEIGHT = 0.4
+PROCESS_WEIGHT = 0.4
+LENGTH_WEIGHT = 0.2
 
 # --- 正则表达式定义 ---
 # 使用 `re.compile` 预编译正则表达式可以提升重复使用时的性能，因为编译过程只需要执行一次。
@@ -114,48 +133,25 @@ def string_reward(pred: str, target: str) -> float:
     return overlap / denom
 
 
-def score_math_answer(
+def _compute_result_reward(
     prediction: str,
     reference: str,
-    *,
-    metadata: dict | None = None,
+    metadata: dict,
 ) -> float:
-    """综合奖励函数，用于给出一个最终的奖励分数。
-
-    这是本模块的核心，它整合了多种策略来给出一个尽可能准确和鲁棒的评估：
-    1.  **提取目标答案**: 首先从参考答案 `reference` 中提取 `\boxed` 内容，
-        如果找不到，则使用整个参考答案作为目标 `target`。这确保我们总有一个明确的比较对象。
-    2.  **提取预测候选**: 从模型生成的 `prediction` 中提取候选答案。
-        - 优先使用 `\boxed` 内容，因为这通常是模型明确标记的最终答案。
-        - 如果没有，则提取所有数值。这对于答案是纯数字的问题很有效。
-        - 如果连数值都没有，则使用生成文本的最后一行作为候选。这是一个通用的回退策略。
-    3.  **计算最佳分数**: 遍历所有预测候选，分别计算它们与目标的 `numerical_reward`
-        和 `string_reward`，取其中的最大值作为该候选的分数。最终，所有候选的
-        最高分即为 `best` 分数。这种“取最优”的策略增加了对模型输出格式变化的容忍度。
-    4.  **元数据加成**: 根据 `metadata` 中的信息（如题目难度）对分数进行微调。
-        例如，如果模型为一个“困难”问题生成了很长的推理过程，即使最终答案
-        略有偏差，也给予一定的额外奖励，以鼓励模型进行更详细的思考。这是一种领域知识的注入。
-    5.  **分数裁剪**: 确保最终分数在 [0.0, 1.2] 的合理范围内。允许分数超过 1.0 是为了给特别好的答案（如详细且正确的难题解答）一个额外的信号。
-    """
-    metadata = metadata or {}
-
-    # 1. 确定目标答案
+    """沿用历史逻辑计算结果奖励。"""
     target = extract_boxed(reference) or reference.strip()
-    prediction = prediction.strip()
+    cleaned_prediction = prediction.strip()
 
-    # 2. 提取预测候选
-    pred_box = extract_boxed(prediction)
+    pred_box = extract_boxed(cleaned_prediction)
     if pred_box:
         pred_candidates = [pred_box]
     else:
-        pred_candidates = extract_numeric_candidates(prediction)
-        if not pred_candidates and prediction:
-            # 如果没有数值候选，则取最后一行作为候选
-            pred_candidates = [prediction.splitlines()[-1]]
+        pred_candidates = extract_numeric_candidates(cleaned_prediction)
+        if not pred_candidates and cleaned_prediction:
+            pred_candidates = [cleaned_prediction.splitlines()[-1]]
 
-    # 3. 计算最佳分数
     best = 0.0
-    if not pred_candidates: # 如果没有任何候选答案，分数为0
+    if not pred_candidates:
         return 0.0
 
     for candidate in pred_candidates:
@@ -165,18 +161,256 @@ def score_math_answer(
         )
         best = max(best, score)
 
-    # 4. 根据元数据进行奖励调整
     difficulty = metadata.get("difficulty", "medium")
-    # 使用生成答案的长度作为推理过程长度的近似
-    reasoning_len = len(prediction.split())
-    if best > 0.9: # 只在答案基本正确时给予额外奖励
+    reasoning_len = len(cleaned_prediction.split())
+    if best > 0.9:
         if difficulty == "hard" and reasoning_len > 160:
-            best += 0.1 # 对难题的详细解答给予奖励
+            best += 0.1
         elif difficulty == "easy" and reasoning_len < 60:
-            best += 0.05 # 对简单问题的简洁解答给予奖励
+            best += 0.05
 
-    # 5. 裁剪分数
     return float(max(0.0, min(best, 1.2)))
+
+
+class ProcessRewardError(RuntimeError):
+    """过程奖励评估异常。"""
+
+
+def _split_into_steps(text: str) -> list[str]:
+    """将一个长文本智能拆分成步骤列表。"""
+
+    if not isinstance(text, str):
+        return []
+
+    normalized = text.replace("\r\n", "\n").strip()
+    if not normalized:
+        return []
+
+    # 优先使用空行切分（常用于列条步骤）。
+    candidates = [
+        part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()
+    ]
+    if len(candidates) > 1:
+        return candidates
+
+    # 其次按单行切分。
+    candidates = [part.strip() for part in normalized.split("\n") if part.strip()]
+    if len(candidates) > 1:
+        return candidates
+
+    # 最后按句号/分号等符号切分，保留原文本。
+    candidates = [
+        part.strip()
+        for part in re.split(r"(?<=[。！？!?；;])\s+", normalized)
+        if part.strip()
+    ]
+    if len(candidates) > 1:
+        return candidates
+
+    return [normalized]
+
+
+def _infer_truncation(metadata: dict, reasoning_text: str | None) -> bool:
+    """根据 metadata 与文本长度推断是否被截断。"""
+
+    truncation_flags = (
+        "truncated",
+        "was_truncated",
+        "hit_max_length",
+        "cutoff",
+        "length_truncated",
+    )
+    for key in truncation_flags:
+        if metadata.get(key):
+            return True
+
+    finish_reason = str(metadata.get("finish_reason", "")).lower()
+    if finish_reason in {"length", "max_tokens", "max_length"}:
+        return True
+
+    if reasoning_text and len(reasoning_text) > MAX_REASONING_LENGTH:
+        return True
+
+    return False
+
+
+def _gather_process_context(
+    prediction: str,
+    metadata: dict,
+) -> tuple[str | None, list[str], str, bool]:
+    """收集生成过程相关信息，用于过程与长度奖励。"""
+
+    question = (
+        metadata.get("question") or metadata.get("prompt") or metadata.get("input")
+    )
+
+    provided_steps = metadata.get("steps") or metadata.get("process_steps")
+    steps: list[str] = []
+    if isinstance(provided_steps, Sequence) and not isinstance(
+        provided_steps, (str, bytes)
+    ):
+        for item in provided_steps:
+            text = str(item).strip()
+            if text:
+                steps.append(text)
+
+    reasoning_text_parts: list[str] = []
+    for key in ("thinking", "reasoning", "chain_of_thought", "scratchpad"):
+        value = metadata.get(key)
+        if isinstance(value, str) and value.strip():
+            reasoning_text_parts.append(value.strip())
+
+    answer_text = metadata.get("answer")
+    if not isinstance(answer_text, str) or not answer_text.strip():
+        answer_text = prediction
+    else:
+        answer_text = answer_text.strip()
+
+    if not steps:
+        for part in reasoning_text_parts:
+            steps.extend(_split_into_steps(part))
+        if isinstance(answer_text, str):
+            steps.extend(_split_into_steps(answer_text))
+
+    cleaned_steps: list[str] = []
+    previous = None
+    for item in steps:
+        text = item.strip()
+        if text and text != previous:
+            cleaned_steps.append(text)
+            previous = text
+
+    reasoning_text = "\n\n".join(reasoning_text_parts)
+    if not reasoning_text:
+        reasoning_text = answer_text if isinstance(answer_text, str) else prediction
+
+    truncated = _infer_truncation(metadata, reasoning_text)
+    return question, cleaned_steps, reasoning_text or "", truncated
+
+
+def _fetch_process_reward(question: str, steps: Sequence[str]) -> dict:
+    """调用过程奖励 API。"""
+
+    if requests is None:
+        raise ProcessRewardError("requests 库未安装，无法调用过程奖励 API。")
+
+    url = PRM_BASE_URL.rstrip("/") + PRM_SCORE_ENDPOINT
+    payload = {"question": question, "steps": list(steps)}
+
+    try:
+        response = requests.post(
+            url,
+            json=payload,
+            timeout=PRM_TIMEOUT_SECONDS,
+        )
+        response.raise_for_status()
+    except Exception as exc:  # pragma: no cover - 网络异常路径
+        raise ProcessRewardError(f"调用 {url} 失败: {exc}") from exc
+
+    try:
+        data = response.json()
+    except ValueError as exc:
+        raise ProcessRewardError("过程奖励 API 返回非 JSON 数据") from exc
+
+    if not isinstance(data, dict):
+        raise ProcessRewardError("过程奖励 API 返回的 JSON 不是对象类型")
+
+    return data
+
+
+def _reduce_process_scores(response_json: dict) -> float:
+    """根据 API 返回值提取过程奖励分数，默认几何平均。"""
+
+    scores = response_json.get("scores")
+    values: list[float] = []
+    if isinstance(scores, Sequence) and not isinstance(scores, (str, bytes)):
+        for item in scores:
+            try:
+                values.append(float(item))
+            except (TypeError, ValueError):
+                continue
+    if values:
+        return sum(values) / len(values)
+
+    for key in ("geometric_mean", "average", "mean", "last", "maximum"):
+        value = response_json.get(key)
+        if isinstance(value, (int, float)):
+            return float(value)
+
+    return 0.0
+
+
+def _compute_process_reward(
+    question: str | None,
+    steps: Sequence[str],
+) -> float:
+    """计算过程奖励，若信息不足返回 0。"""
+
+    if not question or not steps:
+        return 0.0
+
+    try:
+        response = _fetch_process_reward(question, steps)
+    except ProcessRewardError as exc:
+        logger.warning("过程奖励 API 调用失败，默认 0 分：%s", exc)
+        return 0.0
+
+    score = _reduce_process_scores(response)
+    return float(max(0.0, min(score, 1.0)))
+
+
+def _compute_length_reward(reasoning_text: str, truncated: bool) -> float:
+    """计算长度奖励。"""
+
+    if truncated:
+        return -0.5
+
+    normalized = reasoning_text.strip()
+    if not normalized:
+        return 0.0
+
+    length = len(normalized)
+    if length > MAX_REASONING_LENGTH:
+        return -0.5
+
+    return min(length / MAX_REASONING_LENGTH, 1.0)
+
+
+def score_math_answer(
+    prediction: str,
+    reference: str,
+    *,
+    metadata: dict | None = None,
+) -> float:
+    """综合奖励函数，用于给出一个最终的奖励分数。
+
+    新的奖励函数包含三部分：
+
+    1. **结果奖励（40%）**：沿用原有的答案匹配逻辑，对预测最终答案进行评分。
+    2. **过程奖励（40%）**：将 `thinking`/`answer` 文本拆分为步骤列表，调用过程奖励模型 API，并对返回的分数取算术平均。
+    3. **长度奖励（20%）**：鼓励更长的推理过程；若推理被截断（>4096 字符或显式标记），给予 -0.5 惩罚。
+
+    如果缺少某一部分所需信息，则该部分奖励默认降为 0 分（长度奖励截断仍可能为负分），并继续组合其它部分，确保整体鲁棒。
+    """
+    metadata = metadata or {}
+
+    result_reward = min(
+        _compute_result_reward(prediction, reference, metadata),
+        1.0,
+    )
+    question, steps, reasoning_text, truncated = _gather_process_context(
+        prediction,
+        metadata,
+    )
+    process_reward = _compute_process_reward(question, steps)
+    length_reward = _compute_length_reward(reasoning_text, truncated)
+
+    final_reward = (
+        RESULT_WEIGHT * result_reward
+        + PROCESS_WEIGHT * process_reward
+        + LENGTH_WEIGHT * length_reward
+    )
+    return float(max(-1.0, min(final_reward, 1.0)))
 
 
 def batch_reward(

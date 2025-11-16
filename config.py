@@ -197,15 +197,19 @@ class TrainingConfig:
     )
     gradient_checkpointing: bool = (
         True  # 是否启用梯度检查点。这是一种用计算时间换取显存的技术，通过在前向传播中不保存所有中间激活值，
-              # 而是在反向传播时重新计算它们，从而显著减少显存消耗。
+        # 而是在反向传播时重新计算它们，从而显著减少显存消耗。
     )
 
     # --- LoRA (Low-Rank Adaptation) 配置 ---
     # LoRA 是一种参数高效的微调技术，它通过训练小型的“适配器”矩阵来修改模型行为，而无需改动原始的大量权重。
     lora_rank: int = 64  # LoRA 矩阵的秩。越高的秩意味着更强的表达能力，但参数也更多。
-    lora_alpha: int = 64  # LoRA 缩放因子。它控制了 LoRA 适配器对原始模型输出的影响程度。通常设置为与 lora_rank 相同或两倍。
+    lora_alpha: int = (
+        64  # LoRA 缩放因子。它控制了 LoRA 适配器对原始模型输出的影响程度。通常设置为与 lora_rank 相同或两倍。
+    )
     lora_dropout: float = 0.05  # LoRA 层的 Dropout 概率，用于防止过拟合。
-    use_rslora: bool = False  # 是否使用 Rank-Stabilized LoRA，一种改进的 LoRA 算法，通过调整 alpha 来稳定训练。
+    use_rslora: bool = (
+        False  # 是否使用 Rank-Stabilized LoRA，一种改进的 LoRA 算法，通过调整 alpha 来稳定训练。
+    )
 
     # --- 训练过程配置 ---
     batch_size: int = 1  # 每个设备上的批次大小
@@ -230,9 +234,7 @@ class TrainingConfig:
     # `field(default_factory=...)` 用于为可变类型的字段（如列表、字典）提供默认值。
     # 它确保每次创建 `TrainingConfig` 实例时，都会调用 `_default_dataset_mix()` 来生成一个新的元组，
     # 避免了所有实例共享同一个可变默认值的问题。
-    dataset_mix: Sequence[DatasetSource] = field(
-        default_factory=_default_dataset_mix
-    )
+    dataset_mix: Sequence[DatasetSource] = field(default_factory=_default_dataset_mix)
     eval_split_ratio: float = 0.02  # 从训练集中划分出用于评估的比例
     dataset_num_proc: int = 1  # 数据预处理时使用的进程数
     cache_dir: Optional[Path] = None  # Hugging Face datasets 的缓存目录
@@ -285,18 +287,24 @@ class GRPOConfig:
     clip_range: float = 0.2  # PPO 算法中的裁剪范围
     kl_coef: float = 0.06  # KL 散度系数，用于惩罚策略模型与参考模型的差异
     value_loss_coef: float = 0.01  # 值函数损失的系数
-    mini_batch_size: int = 8  # GRPO 训练的 mini-batch 大小
+    mini_batch_size: int = 4  # GRPO 训练的 mini-batch 大小
     gradient_accumulation_steps: int = 1  # 梯度累积步数
     num_generations_per_prompt: int = 2  # 每个 prompt 生成的回答数量，用于构建偏好对
-    max_prompt_len: int = 768  # 生成回答时，prompt 的最大长度
-    max_completion_len: int = 2048  # 生成回答时，completion 的最大长度
+    max_prompt_len: int = 1024  # 生成回答时，prompt 的最大长度
+    max_completion_len: int = 4096  # 生成回答时，completion 的最大长度
     reward_temperature: float = 1.0  # 奖励模型的温度系数
     reference_free: bool = False  # 是否使用无参考模型的 GRPO 变体
     mixed_precision: Optional[str] = "bf16"  # 混合精度训练类型
     save_steps: int = 20  # GRPO 检查点的保存频率
     unsloth_num_chunks: int = 1  # unsloth 库的特定参数
-    dataset: Optional[DatasetSource] = field(default_factory=_default_grpo_dataset)  # GRPO 阶段使用的数据集
+    dataset: Optional[DatasetSource] = field(
+        default_factory=_default_grpo_dataset
+    )  # GRPO 阶段使用的数据集
     max_tokens_per_step: Optional[int] = None  # 每步优化的最大 token 数预算
+    generation_batch_size: Optional[int] = None  # 单次前向生成使用的 prompt 数
+    # 若为 None 则默认与 mini_batch_size 保持一致。
+    # 注意：HFGRPOConfig 要求 generation_batch_size 能被 num_generations 整除；
+    # 构建 HF 配置时会自动调整到最近的可整除值（>= 原值）。
 
     def describe_workload(self, training: TrainingConfig) -> dict[str, int]:
         """估算单步 GRPO 训练的 token 与样本开销，用于资源规划和调试。"""
@@ -339,8 +347,6 @@ class EvaluationConfig:
 
     这个类定义了在评估模型性能时，文本生成过程所使用的参数（即采样参数）。
     """
-
-
 
     sample_size: int = 100  # 用于评估的样本数量
     max_new_tokens: int = 512  # 生成文本的最大长度

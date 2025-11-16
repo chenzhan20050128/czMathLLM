@@ -8,7 +8,24 @@ snapshot_download(
     max_workers=8,  # 启用多线程（建议4-8个线程）
 )
 "
-
+# 1117 0：03 最新命令行
+cd /root/autodl-tmp/.autodl/czMathLLM
+python cli.py grpo \
+  --base-model-path models/Qwen3-4B-Thinking-2507 \
+  --micro-batch-size 4 \
+  --gradient-accumulation-steps 1 \
+  --grpo-mini-batch 8 \
+  --grpo-gradient-accumulation 1 \
+  --grpo-num-generations 4 \
+  --grpo-max-prompt-len 768 \
+  --grpo-max-completion-len 3328 \
+  --no-grpo-reference-free \
+  --grpo-learning-rate 8e-6 \
+  --grpo-beta 0.2 \
+  --grpo-kl 0.06 \
+  --grpo-steps 500 \
+  --resume-from-checkpoint outputs/local_sft_big/checkpoints/grpo/checkpoint-320 \
+  --output-dir outputs/local_sft_big
 
 # czMathLLM
 

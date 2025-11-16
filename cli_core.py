@@ -239,6 +239,11 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
     num_generations = getattr(args, "grpo_num_generations", None)
     if num_generations is not None:
         project.grpo.num_generations_per_prompt = num_generations
+    generation_batch = getattr(args, "grpo_generation_batch", None)
+    if generation_batch is not None:
+        project.grpo.generation_batch_size = (
+            generation_batch if generation_batch > 0 else None
+        )
     max_tokens_per_step = getattr(args, "grpo_max_tokens_per_step", None)
     if max_tokens_per_step is not None:
         project.grpo.max_tokens_per_step = (
@@ -263,6 +268,7 @@ def _apply_common_overrides(project: ProjectConfig, args: argparse.Namespace) ->
 # --- 参数注册函数 ---
 # 将相关参数的定义封装在独立的函数中，使 `build_parser` 函数更清晰、更模块化。
 # 这种做法提高了代码的可读性和可维护性。
+
 
 def _add_dataset_args(parser: argparse.ArgumentParser) -> None:
     """注册与数据源相关的命令行参数."""
@@ -355,10 +361,16 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
         help="训练输出和检查点的根目录",
     )
     parser.add_argument(
-        "--experiment-name", type=str, default="qwen_math_tutor", help="实验名称，用于区分不同的运行"
+        "--experiment-name",
+        type=str,
+        default="qwen_math_tutor",
+        help="实验名称，用于区分不同的运行",
     )
     parser.add_argument(
-        "--eval-split-ratio", type=float, default=0.02, help="从训练集中划分出的验证集比例"
+        "--eval-split-ratio",
+        type=float,
+        default=0.02,
+        help="从训练集中划分出的验证集比例",
     )
     parser.add_argument(
         "--dataset-num-proc", type=int, default=1, help="数据预处理时使用的进程数"
@@ -385,13 +397,28 @@ def _add_train_args(parser: argparse.ArgumentParser) -> None:
 
 def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
     """注册 GRPO 阶段的特有参数。"""
-    parser.add_argument("--with-grpo", action="store_true", help="在 SFT 后启用 GRPO 训练")
+    parser.add_argument(
+        "--with-grpo", action="store_true", help="在 SFT 后启用 GRPO 训练"
+    )
     parser.add_argument("--grpo-steps", type=int, default=500, help="GRPO 训练的总步数")
-    parser.add_argument("--grpo-learning-rate", type=float, default=8e-6, help="GRPO 阶段的学习率")
-    parser.add_argument("--grpo-beta", type=float, default=0.2, help="GRPO 损失中的 beta 参数 (KL 散度权重)")
-    parser.add_argument("--grpo-kl", type=float, default=0.06, help="GRPO 的 KL 散度系数")
-    parser.add_argument("--grpo-mini-batch", type=int, default=16, help="GRPO 的 mini-batch 大小")
-    parser.add_argument("--grpo-gradient-accumulation", type=int, default=1, help="GRPO 的梯度累积步数")
+    parser.add_argument(
+        "--grpo-learning-rate", type=float, default=8e-6, help="GRPO 阶段的学习率"
+    )
+    parser.add_argument(
+        "--grpo-beta",
+        type=float,
+        default=0.2,
+        help="GRPO 损失中的 beta 参数 (KL 散度权重)",
+    )
+    parser.add_argument(
+        "--grpo-kl", type=float, default=0.06, help="GRPO 的 KL 散度系数"
+    )
+    parser.add_argument(
+        "--grpo-mini-batch", type=int, default=16, help="GRPO 的 mini-batch 大小"
+    )
+    parser.add_argument(
+        "--grpo-gradient-accumulation", type=int, default=1, help="GRPO 的梯度累积步数"
+    )
     parser.add_argument(
         "--grpo-reference-free",
         dest="grpo_reference_free",
@@ -413,7 +440,10 @@ def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
         help="用于 GRPO 的特定数据集 (HF 仓库或本地文件)",
     )
     parser.add_argument(
-        "--grpo-dataset-split", type=str, default=None, help="GRPO 数据集使用的数据切分 (如 'train')"
+        "--grpo-dataset-split",
+        type=str,
+        default=None,
+        help="GRPO 数据集使用的数据切分 (如 'train')",
     )
     parser.add_argument(
         "--grpo-dataset-max-samples",
@@ -438,6 +468,12 @@ def _add_grpo_args(parser: argparse.ArgumentParser) -> None:
         type=int,
         default=2,
         help="在 GRPO 期间，每个 prompt 生成的响应数量",
+    )
+    parser.add_argument(
+        "--grpo-generation-batch",
+        type=int,
+        default=None,
+        help="GRPO generation_batch_size；需能被 grpo-num-generations 整除，默认与 grpo-mini-batch 一致并自动向上调整",
     )
     parser.add_argument(
         "--grpo-save-steps",
@@ -546,7 +582,9 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     # --- 定义 'train' 子命令 ---
-    train_parser = subparsers.add_parser("train", help="运行监督微调 (SFT)，可选择性地后跟 GRPO")
+    train_parser = subparsers.add_parser(
+        "train", help="运行监督微调 (SFT)，可选择性地后跟 GRPO"
+    )
     _add_dataset_args(train_parser)
     _add_model_args(train_parser)
     _add_lora_args(train_parser)
