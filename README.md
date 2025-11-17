@@ -14,7 +14,7 @@ python cli.py grpo \
   --base-model-path models/Qwen3-4B-Thinking-2507 \
   --micro-batch-size 4 \
   --gradient-accumulation-steps 1 \
-  --grpo-mini-batch 8 \
+  --grpo-mini-batch 4 \
   --grpo-gradient-accumulation 1 \
   --grpo-num-generations 4 \
   --grpo-max-prompt-len 768 \
@@ -85,12 +85,6 @@ export MATH_LLM_SECONDARY_ENDPOINT="https://hf-mirror.com"
 
 ### 数据格式
 
-项目会在加载阶段自动归一化字段，支持下列键名（区分大小写）：
-
-| 语义 | 默认键名 | 兼容键 | 说明 |
-| --- | --- | --- | --- |
-| 题目 | `question` | `prompt`、`instruction`、`problem`、`input` | 必填 |
-| 最终答案 | `final_answer` | 自动推断，或 `final`, `answer_box` 等 | 可选 |
 | 参考答案 | `answer` | `response`、`completion`、`target` 等 | 必填 |
 | 推理链 | `reasoning` | `rationale`、`chain_of_thought`、`cot` 等 | 无则回退到 `answer` |
 
@@ -98,6 +92,15 @@ export MATH_LLM_SECONDARY_ENDPOINT="https://hf-mirror.com"
 
 - 若缺失 `final_answer`，尝试解析 `\boxed{...}`、`Answer:`、中文“最终答案”等模式；否则取答案末行。
 - 额外生成 `metadata`，包含题目/推理长度统计、难度标签 (`easy/medium/hard`)、主题标签（几何/代数等）。
+
+
+为避免磁盘占用过大，GRPO 训练阶段在每次保存后会自动清理旧的检查点，仅保留最新的 3 个 `checkpoint-<step>` 目录。
+
+- 清理范围：`<output_dir>/checkpoints/grpo/` 下形如 `checkpoint-<step>` 的目录。
+- 保留数量：默认保留 3 个；如果训练配置 `save_total_limit` 大于 3，则按更大的值保留。
+- 不会删除 `last` 或其他非 `checkpoint-<step>` 命名的目录。
+
+无需额外参数，即可自动生效。
 
 ### 数据集配置
 

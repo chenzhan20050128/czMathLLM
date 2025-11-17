@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import inspect
 from dataclasses import fields
+import shutil
+import re
 from pathlib import Path
 from typing import Any, Optional
 
@@ -130,6 +132,65 @@ class _RewardLoggingCallback(TrainerCallback):
         """在整个训练过程结束时被调用."""
         # 确保训练结束时残留的记录被输出。
         self._buffer.flush(state.global_step)
+
+
+class _CheckpointPruningCallback(TrainerCallback):
+    """在保存事件触发时清理旧的 checkpoint，仅保留最新的 N 个。
+
+    该回调通过检测 output_dir 下形如 `checkpoint-<step>` 的子目录，
+    按数字步骤或修改时间排序，仅保留最近的 `keep_last` 个，其余使用
+    `shutil.rmtree` 递归删除，以控制磁盘占用。
+    """
+
+    _PATTERN = re.compile(r"^checkpoint-(\d+)$")
+
+    def __init__(self, output_dir: Path, keep_last: int) -> None:
+        super().__init__()
+        self._output_dir = Path(output_dir)
+        self._keep_last = max(1, int(keep_last))
+
+    def _collect_checkpoints(self) -> list[tuple[int, Path]]:
+        if not self._output_dir.exists():
+            return []
+        items: list[tuple[int, Path]] = []
+        for p in self._output_dir.iterdir():
+            if not p.is_dir():
+                continue
+            m = self._PATTERN.match(p.name)
+            if not m:
+                continue
+            try:
+                step = int(m.group(1))
+            except Exception:
+                # 兜底：按 mtime 排序时用 -1
+                step = -1
+            items.append((step, p))
+        # 优先按 step 降序；若 step 不可解析（-1），退化按 mtime 降序
+        items.sort(key=lambda t: (t[0], t[1].stat().st_mtime), reverse=True)
+        return items
+
+    def _prune(self) -> None:
+        try:
+            items = self._collect_checkpoints()
+            if len(items) <= self._keep_last:
+                return
+            to_remove = items[self._keep_last :]
+            for _, path in to_remove:
+                try:
+                    print(f"[GRPO] 清理旧 checkpoint: {path}")
+                    shutil.rmtree(path, ignore_errors=True)
+                except Exception as e:
+                    print(f"[GRPO][warn] 删除 {path} 失败: {e}")
+        except Exception as e:
+            print(f"[GRPO][warn] checkpoint 清理过程出错: {e}")
+
+    # 当 Trainer 触发保存时调用
+    def on_save(self, args, state, control, **kwargs):
+        self._prune()
+
+    # 训练结束时再执行一次兜底清理
+    def on_train_end(self, args, state, control, **kwargs):
+        self._prune()
 
 
 def _format_int(value: int) -> str:
@@ -526,6 +587,13 @@ def run_grpo_training(
         config_kwargs["mixed_precision"] = grpo_cfg.mixed_precision
     if "save_steps" in available_fields:
         config_kwargs["save_steps"] = grpo_cfg.save_steps
+    # 尽可能将训练阶段的 save_total_limit 传递给 HF 配置（不同版本可能不支持）
+    if "save_total_limit" in available_fields:
+        try:
+            save_total_limit = int(training_cfg.save_total_limit)
+        except Exception:
+            save_total_limit = 3
+        config_kwargs["save_total_limit"] = save_total_limit
     if "output_dir" in available_fields:
         config_kwargs["output_dir"] = str(grpo_output_dir)
     if "generation_batch_size" in available_fields:
@@ -546,6 +614,13 @@ def run_grpo_training(
         config_kwargs["num_generations"] = grpo_cfg.num_generations_per_prompt
     if "unsloth_num_chunks" in available_fields:
         config_kwargs["unsloth_num_chunks"] = grpo_cfg.unsloth_num_chunks
+
+    # 显式设置 steps_per_generation = grpo 的梯度累积（与 generation_batch_size 互斥）
+    if (
+        "steps_per_generation" in available_fields
+        and "generation_batch_size" not in config_kwargs
+    ):
+        config_kwargs["steps_per_generation"] = grpo_cfg.gradient_accumulation_steps
 
     hf_config = HFGRPOConfig(**config_kwargs)
     # 确保 max_steps 被正确设置
@@ -600,6 +675,17 @@ def run_grpo_training(
     # 6. 初始化并执行训练
     trainer = GRPOTrainer(**trainer_kwargs)
     trainer.add_callback(_RewardLoggingCallback(reward_buffer))
+    # 注册 checkpoint 清理回调：至少保留 3 个
+    try:
+        keep_last = max(3, int(training_cfg.save_total_limit))
+    except Exception:
+        keep_last = 3
+    trainer.add_callback(
+        _CheckpointPruningCallback(
+            output_dir=grpo_output_dir,
+            keep_last=keep_last,
+        )
+    )
 
     # 再次在 trainer 上强制覆盖关键 batch 配置（尤其是在 resume_from_checkpoint 时，
     # 某些库可能会参考 checkpoint 中保存的旧参数进行展示/打印）。
@@ -615,6 +701,15 @@ def run_grpo_training(
                 "gradient_accumulation_steps",
                 grpo_cfg.gradient_accumulation_steps,
             )
+            # 同步 steps_per_generation（仅当未已配置 generation_batch_size 时）
+            if hasattr(trainer.args, "steps_per_generation") and not getattr(
+                trainer.args, "generation_batch_size", None
+            ):
+                setattr(
+                    trainer.args,
+                    "steps_per_generation",
+                    grpo_cfg.gradient_accumulation_steps,
+                )
             t_bs = getattr(trainer.args, "per_device_train_batch_size", "n/a")
             t_gas = getattr(trainer.args, "gradient_accumulation_steps", "n/a")
             print(
@@ -624,10 +719,102 @@ def run_grpo_training(
     except Exception:
         pass
 
+    # 若 checkpoint 中保存的参数与当前 CLI 不一致，则不要把 resume_from_checkpoint 传给 HF Trainer，
+    # 以避免旧参数覆盖导致的 batch/num_generations 错配（会触发 rewards.view 的 shape 错误）。
+    def _should_resume(checkpoint_dir: Optional[str]) -> bool:
+        if not checkpoint_dir:
+            return False
+        try:
+            state_file = Path(checkpoint_dir) / "trainer_state.json"
+            if not state_file.exists():
+                return False
+            import json as _json
+
+            with state_file.open("r", encoding="utf-8") as fh:
+                state = _json.load(fh)
+            # 兼容不同版本：尽可能从 state 顶层或嵌套字段中取出我们关心的键
+
+            def _get(d: dict, keys: list[str], default=None):
+                for k in keys:
+                    if k in d:
+                        return d[k]
+                return default
+
+            ckpt_bs = _get(state, ["per_device_train_batch_size", "train_batch_size"])
+            ckpt_gas = _get(state, ["gradient_accumulation_steps", "grad_accum_steps"])
+            ckpt_num_gen = _get(state, ["num_generations"])  # 可能不存在
+            ckpt_gen_batch = _get(state, ["generation_batch_size"])  # 可能不存在
+            ckpt_spg = _get(state, ["steps_per_generation"])  # 可能不存在
+
+            want_bs = getattr(hf_config, "per_device_train_batch_size", None)
+            want_gas = getattr(hf_config, "gradient_accumulation_steps", None)
+            want_num_gen = getattr(hf_config, "num_generations", None)
+            want_gen_batch = getattr(hf_config, "generation_batch_size", None)
+            want_spg = getattr(hf_config, "steps_per_generation", None)
+
+            mismatches: list[str] = []
+            if (
+                ckpt_bs is not None
+                and want_bs is not None
+                and int(ckpt_bs) != int(want_bs)
+            ):
+                mismatches.append(
+                    f"per_device_train_batch_size: {ckpt_bs} -> {want_bs}"
+                )
+            if (
+                ckpt_gas is not None
+                and want_gas is not None
+                and int(ckpt_gas) != int(want_gas)
+            ):
+                mismatches.append(
+                    f"gradient_accumulation_steps: {ckpt_gas} -> {want_gas}"
+                )
+            if (
+                ckpt_num_gen is not None
+                and want_num_gen is not None
+                and int(ckpt_num_gen) != int(want_num_gen)
+            ):
+                mismatches.append(f"num_generations: {ckpt_num_gen} -> {want_num_gen}")
+            if (
+                ckpt_gen_batch is not None
+                and want_gen_batch is not None
+                and int(ckpt_gen_batch) != int(want_gen_batch)
+            ):
+                mismatches.append(
+                    ("generation_batch_size: " f"{ckpt_gen_batch} -> {want_gen_batch}")
+                )
+            if (
+                ckpt_spg is not None
+                and want_spg is not None
+                and int(ckpt_spg) != int(want_spg)
+            ):
+                mismatches.append(f"steps_per_generation: {ckpt_spg} -> {want_spg}")
+
+            if mismatches:
+                print(
+                    (
+                        "[GRPO] 检测到 checkpoint 与当前 CLI 的关键参数不一致，"
+                        "将忽略训练恢复，仅加载权重：\n  - "
+                    )
+                    + "\n  - ".join(mismatches)
+                )
+                return False
+            return True
+        except Exception:
+            # 保守处理：未知结构则不恢复
+            return False
+
     train_kwargs = {}
     train_sig = inspect.signature(trainer.train)
-    if "resume_from_checkpoint" in train_sig.parameters:
+    if "resume_from_checkpoint" in train_sig.parameters and _should_resume(
+        resume_from_checkpoint
+    ):
         train_kwargs["resume_from_checkpoint"] = resume_from_checkpoint
+    else:
+        if resume_from_checkpoint:
+            print(
+                "[GRPO] 将忽略 checkpoint 的 Trainer 状态（resume），按当前配置重新开始优化。"
+            )
 
     trainer.train(**train_kwargs)
 
